@@ -1,0 +1,23 @@
+# BlueSky Multi-UAV Tactical Conflict Scenario
+# Origin: EHAM / Amsterdam area (Lat 52.3676, Lon 4.9041)
+# Units: CRE <id>, <type>, <lat>, <lon>, <heading_deg>, <alt_ft>, <speed_kts>
+# 15 m/s ~= 29.15 knots; 100 m ~= 328 ft
+
+00:00:00.00>OP
+00:00:00.00>PAN 52.3676, 4.9041
+00:00:00.00>ZOOM 15
+
+# Drone 1 (T1): Direct head-on conflict approaching from the North (heading South 180 deg)
+# Starts 350 m North, flying South at ~15 m/s (29.15 kts) at 100 m altitude
+00:00:00.00>CRE T1, M600, 52.37075, 4.90410, 180, 328, 29.15
+
+# Drone 2 (T2): 90-degree crossing conflict from the East (heading West 270 deg)
+# Starts 350 m East, flying West at ~12 m/s (23.32 kts) at 100 m altitude
+00:00:00.00>CRE T2, M600, 52.36760, 4.90924, 270, 328, 23.32
+
+# Drone 3 (T3): Oblique crossing conflict from the North-East (heading South-West 225 deg)
+# Starts 300 m NE, flying SW at ~14 m/s (27.21 kts) at 100 m altitude
+00:00:00.00>CRE T3, M600, 52.36951, 4.90722, 225, 328, 27.21
+
+# Drone 4 (T4): Safe parallel traffic 150 m West (heading North 0 deg)
+00:00:00.00>CRE T4, M600, 52.36500, 4.90190, 0, 328, 25.00

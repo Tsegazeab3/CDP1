@@ -1,0 +1,1047 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autonomous UAV 3D Tactical Deconfliction & Physics Flight Deck</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+    }
+    body {
+      background-color: #06090e;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+    }
+    #canvas-container {
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 1;
+    }
+    /* HUD Overlays */
+    .hud-header {
+      position: absolute;
+      top: 16px;
+      left: 20px;
+      z-index: 10;
+      background: rgba(10, 15, 26, 0.85);
+      border: 1px solid rgba(0, 229, 255, 0.3);
+      border-radius: 8px;
+      padding: 14px 20px;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    }
+    .hud-title {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: #00e5ff;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .hud-subtitle {
+      font-size: 11px;
+      color: #94a3b8;
+      margin-top: 4px;
+      letter-spacing: 0.5px;
+    }
+    .status-badge {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 10px #10b981;
+    }
+    .status-badge.conflict {
+      background: #ef4444;
+      box-shadow: 0 0 12px #ef4444;
+      animation: pulse 0.8s infinite alternate;
+    }
+    @keyframes pulse {
+      0% { transform: scale(1); opacity: 0.8; }
+      100% { transform: scale(1.4); opacity: 1; }
+    }
+    /* Controls Panel */
+    .control-panel {
+      position: absolute;
+      top: 16px;
+      right: 20px;
+      z-index: 10;
+      background: rgba(10, 15, 26, 0.85);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 8px;
+      padding: 16px;
+      width: 320px;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    }
+    .panel-section-title {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: #38bdf8;
+      letter-spacing: 1px;
+      margin-bottom: 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-bottom: 4px;
+    }
+    .control-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      font-size: 12px;
+    }
+    .control-row label {
+      color: #cbd5e1;
+    }
+    .control-row input[type="range"] {
+      width: 130px;
+      accent-color: #00e5ff;
+    }
+    .val-display {
+      font-family: monospace;
+      color: #00e5ff;
+      font-size: 11px;
+      min-width: 45px;
+      text-align: right;
+    }
+    .btn-group {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .hud-btn {
+      flex: 1;
+      padding: 8px;
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid rgba(0, 229, 255, 0.3);
+      border-radius: 4px;
+      color: #00e5ff;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-align: center;
+    }
+    .hud-btn:hover {
+      background: rgba(0, 229, 255, 0.2);
+      border-color: #00e5ff;
+    }
+    .hud-btn.active {
+      background: #00e5ff;
+      color: #020617;
+    }
+    /* Telemetry Cards */
+    .telemetry-tray {
+      position: absolute;
+      bottom: 16px;
+      left: 20px;
+      right: 20px;
+      z-index: 10;
+      display: flex;
+      gap: 10px;
+      overflow-x: auto;
+      padding-bottom: 6px;
+      pointer-events: auto;
+    }
+    .telemetry-tray::-webkit-scrollbar {
+      height: 6px;
+    }
+    .telemetry-tray::-webkit-scrollbar-track {
+      background: rgba(10, 15, 26, 0.6);
+      border-radius: 3px;
+    }
+    .telemetry-tray::-webkit-scrollbar-thumb {
+      background: rgba(0, 229, 255, 0.4);
+      border-radius: 3px;
+    }
+    .uav-card {
+      min-width: 210px;
+      flex-shrink: 0;
+      background: rgba(10, 15, 26, 0.88);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 6px;
+      padding: 10px 12px;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+      border-left: 4px solid #00e5ff;
+    }
+    .uav-card.conflict {
+      border-left-color: #ef4444;
+      background: rgba(45, 12, 18, 0.88);
+    }
+    .uav-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .uav-id {
+      font-size: 13px;
+      font-weight: 700;
+      color: #f8fafc;
+    }
+    .uav-mode {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: rgba(0, 229, 255, 0.15);
+      color: #00e5ff;
+    }
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px 10px;
+      font-size: 11px;
+    }
+    .tel-item {
+      display: flex;
+      justify-content: space-between;
+      color: #94a3b8;
+    }
+    .tel-val {
+      color: #f1f5f9;
+      font-family: monospace;
+      font-weight: 600;
+    }
+    .legend-box {
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      z-index: 10;
+      background: rgba(10, 15, 26, 0.85);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-size: 11px;
+      backdrop-filter: blur(8px);
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+      color: #cbd5e1;
+    }
+    .legend-line {
+      width: 16px;
+      height: 3px;
+      border-radius: 2px;
+    }
+  </style>
+</head>
+<body>
+  <div id="canvas-container"></div>
+
+  <!-- Header HUD -->
+  <div class="hud-header">
+    <div class="hud-title">
+      <span class="status-badge" id="global-status-badge"></span>
+      3D Tactical UAV Deconfliction
+    </div>
+    <div class="hud-subtitle">
+      ORCA / RVO2 Engine &bull; Non-Ideal Multirotor 6-DOF Physics &bull; PX4 SITL Telemetry
+    </div>
+  </div>
+
+  <!-- Control Panel -->
+  <div class="control-panel">
+    <div class="panel-section-title">Camera Perspective</div>
+    <div class="btn-group">
+      <button class="hud-btn active" onclick="setCameraView('orbit')">3D Orbit</button>
+      <button class="hud-btn" onclick="setCameraView('chase')">Follow Lead</button>
+      <button class="hud-btn" onclick="setCameraView('top')">Tactical</button>
+      <button class="hud-btn" onclick="setCameraView('side')">Profile</button>
+    </div>
+
+    <div class="panel-section-title" style="margin-top: 14px;">Physical Movement & Disturbance</div>
+    <div class="control-row">
+      <label>Motor Lag (&tau;):</label>
+      <input type="range" id="param-tau" min="0.1" max="1.0" step="0.05" value="0.35" oninput="updatePhysicsParams()">
+      <span class="val-display" id="disp-tau">0.35 s</span>
+    </div>
+    <div class="control-row">
+      <label>Wind Turbulence:</label>
+      <input type="range" id="param-wind" min="0.0" max="4.0" step="0.2" value="1.2" oninput="updatePhysicsParams()">
+      <span class="val-display" id="disp-wind">1.2 m/s</span>
+    </div>
+    <div class="control-row">
+      <label>Max Acceleration:</label>
+      <input type="range" id="param-accel" min="2.0" max="10.0" step="0.5" value="5.0" oninput="updatePhysicsParams()">
+      <span class="val-display" id="disp-accel">5.0 m/s&sup2;</span>
+    </div>
+
+    <div class="panel-section-title" style="margin-top: 14px;">3D Display Layers</div>
+    <div class="control-row">
+      <label>4D SIPP Airspace Corridors</label>
+      <input type="checkbox" id="layer-corridors" checked onchange="toggleLayers()">
+    </div>
+    <div class="control-row">
+      <label>Safety Protective Spheres (25m)</label>
+      <input type="checkbox" id="layer-bubbles" checked onchange="toggleLayers()">
+    </div>
+    <div class="control-row">
+      <label>Velocity Vector Dynamics</label>
+      <input type="checkbox" id="layer-vectors" checked onchange="toggleLayers()">
+    </div>
+    <div class="control-row">
+      <label>Flight Path 3D Ribbons</label>
+      <input type="checkbox" id="layer-ribbons" checked onchange="toggleLayers()">
+    </div>
+
+    <div class="btn-group" style="margin-top: 12px;">
+      <button class="hud-btn" onclick="resetScenario()">Reload Scenario</button>
+      <button class="hud-btn" id="btn-pause" onclick="togglePause()">Pause Sim</button>
+    </div>
+  </div>
+
+  <!-- Real-Time Telemetry Cards -->
+  <div class="telemetry-tray" id="telemetry-tray">
+    <!-- Dynamically Populated by UAVs -->
+  </div>
+
+  <!-- 3D Vector Legend -->
+  <div class="legend-box">
+    <div class="legend-item">
+      <span class="legend-line" style="background: #00e5ff;"></span>
+      <span>SIPP Corridor Flight Level 90m (FL090)</span>
+    </div>
+    <div class="legend-item">
+      <span class="legend-line" style="background: #f97316;"></span>
+      <span>SIPP Corridor Flight Level 105m (FL105)</span>
+    </div>
+    <div class="legend-item">
+      <span class="legend-line" style="background: #00e5ff; border-top: 2px dashed #00e5ff; height: 0;"></span>
+      <span>Preferred Mission Vector (&nu;<sub>pref</sub>)</span>
+    </div>
+    <div class="legend-item">
+      <span class="legend-line" style="background: #f97316; border-top: 2px dashed #f97316; height: 0;"></span>
+      <span>ORCA Commanded Avoidance (&nu;<sub>cmd</sub>)</span>
+    </div>
+    <div class="legend-item">
+      <span class="legend-line" style="background: #eab308;"></span>
+      <span>Actual Physical Flight Path (&nu;<sub>act</sub>)</span>
+    </div>
+  </div>
+
+  <!-- Three.js and OrbitControls -->
+  <script src="/static/js/three.min.js"></script>
+  <script src="/static/js/OrbitControls.js"></script>
+
+  <script>
+    // --- 3D Scene Initialization ---
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x06090e);
+    scene.fog = new THREE.FogExp2(0x06090e, 0.0012);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 3000);
+    camera.position.set(0, 320, 480);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    container.appendChild(renderer.domElement);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.maxDistance = 1500;
+    controls.minDistance = 10;
+    controls.target.set(0, 100, 0);
+
+    // --- Lighting ---
+    const ambientLight = new THREE.AmbientLight(0x2a3b50, 1.2);
+    scene.add(ambientLight);
+
+    const sunLight = new THREE.DirectionalLight(0xffffff, 1.8);
+    sunLight.position.set(200, 500, 200);
+    sunLight.castShadow = true;
+    sunLight.shadow.mapSize.width = 2048;
+    sunLight.shadow.mapSize.height = 2048;
+    sunLight.shadow.camera.near = 100;
+    sunLight.shadow.camera.far = 1200;
+    const d = 400;
+    sunLight.shadow.camera.left = -d;
+    sunLight.shadow.camera.right = d;
+    sunLight.shadow.camera.top = d;
+    sunLight.shadow.camera.bottom = -d;
+    scene.add(sunLight);
+
+    // Ground Grid & Coordinate Axis
+    const gridHelper = new THREE.GridHelper(800, 40, 0x00e5ff, 0x1e293b);
+    gridHelper.position.y = 0;
+    scene.add(gridHelper);
+
+    // Ground Plane for Shadows
+    const groundGeo = new THREE.PlaneGeometry(1600, 1600);
+    const groundMat = new THREE.MeshStandardMaterial({
+      color: 0x070c14,
+      roughness: 0.9,
+      metalness: 0.1,
+    });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -0.5;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // North Indicator Arrow
+    const northArrow = new THREE.ArrowHelper(
+      new THREE.Vector3(0, 0, -1),
+      new THREE.Vector3(0, 1, 0),
+      50,
+      0x00e5ff,
+      12,
+      6
+    );
+    scene.add(northArrow);
+
+    // --- UAV 3D Model Generator ---
+    function createQuadcopterMesh(colorHex) {
+      const group = new THREE.Group();
+
+      // Main fuselage chassis
+      const bodyGeo = new THREE.BoxGeometry(4.0, 1.2, 5.0);
+      const bodyMat = new THREE.MeshStandardMaterial({
+        color: 0x1e293b,
+        metalness: 0.8,
+        roughness: 0.3,
+      });
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      body.castShadow = true;
+      group.add(body);
+
+      // Top Dome
+      const domeGeo = new THREE.SphereGeometry(1.6, 16, 12);
+      const domeMat = new THREE.MeshStandardMaterial({
+        color: colorHex,
+        emissive: colorHex,
+        emissiveIntensity: 0.4,
+        metalness: 0.5,
+        roughness: 0.2,
+      });
+      const dome = new THREE.Mesh(domeGeo, domeMat);
+      dome.position.y = 0.8;
+      dome.scale.set(1.0, 0.5, 1.2);
+      group.add(dome);
+
+      // 4 Carbon-Fiber Quad Arms
+      const armMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.5 });
+      const motorMat = new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.9 });
+      const propMat = new THREE.MeshBasicMaterial({ color: 0x94a3b8, transparent: true, opacity: 0.65 });
+
+      const rotors = [];
+      const armLength = 5.5;
+      const armAngles = [Math.PI / 4, 3 * Math.PI / 4, 5 * Math.PI / 4, 7 * Math.PI / 4];
+
+      armAngles.forEach((angle, idx) => {
+        const armGeo = new THREE.CylinderGeometry(0.3, 0.3, armLength, 8);
+        const arm = new THREE.Mesh(armGeo, armMat);
+        arm.rotation.z = Math.PI / 2;
+        arm.rotation.y = angle;
+        arm.position.x = (armLength / 2) * Math.cos(angle);
+        arm.position.z = (armLength / 2) * Math.sin(angle);
+        group.add(arm);
+
+        // Brushless motor pod
+        const motorGeo = new THREE.CylinderGeometry(0.7, 0.7, 0.8, 12);
+        const motor = new THREE.Mesh(motorGeo, motorMat);
+        motor.position.set(armLength * Math.cos(angle), 0.4, armLength * Math.sin(angle));
+        group.add(motor);
+
+        // Propeller blades (2 blades)
+        const propGroup = new THREE.Group();
+        const bladeGeo = new THREE.BoxGeometry(4.6, 0.05, 0.6);
+        const blade = new THREE.Mesh(bladeGeo, propMat);
+        propGroup.add(blade);
+        propGroup.position.set(armLength * Math.cos(angle), 0.9, armLength * Math.sin(angle));
+        group.add(propGroup);
+        rotors.push(propGroup);
+
+        // Navigation LEDs
+        const ledColor = (angle < Math.PI) ? 0x22c55e : 0xef4444; // Front green, rear red
+        const ledGeo = new THREE.SphereGeometry(0.25, 8, 8);
+        const ledMat = new THREE.MeshBasicMaterial({ color: ledColor });
+        const led = new THREE.Mesh(ledGeo, ledMat);
+        led.position.set(armLength * Math.cos(angle), -0.3, armLength * Math.sin(angle));
+        group.add(led);
+      });
+
+      // Landing skids
+      const skidGeo = new THREE.CylinderGeometry(0.18, 0.18, 5.5, 8);
+      const skidMat = new THREE.MeshStandardMaterial({ color: 0x334155 });
+      const skidLeft = new THREE.Mesh(skidGeo, skidMat);
+      skidLeft.rotation.x = Math.PI / 2;
+      skidLeft.position.set(-2.2, -1.2, 0);
+      group.add(skidLeft);
+
+      const skidRight = new THREE.Mesh(skidGeo, skidMat);
+      skidRight.rotation.x = Math.PI / 2;
+      skidRight.position.set(2.2, -1.2, 0);
+      group.add(skidRight);
+
+      // 3D Protective Safety Bubble (Radius = 25m)
+      const bubbleGeo = new THREE.SphereGeometry(25.0, 24, 16);
+      const bubbleMat = new THREE.MeshStandardMaterial({
+        color: 0x10b981,
+        transparent: true,
+        opacity: 0.14,
+        roughness: 0.2,
+        metalness: 0.1,
+        side: THREE.DoubleSide,
+      });
+      const bubble = new THREE.Mesh(bubbleGeo, bubbleMat);
+      group.add(bubble);
+
+      // Wireframe protective equator rings
+      const ringGeo = new THREE.RingGeometry(24.8, 25.0, 32);
+      const ringMat = new THREE.MeshBasicMaterial({ color: 0x10b981, side: THREE.DoubleSide, transparent: true, opacity: 0.4 });
+      const ringH = new THREE.Mesh(ringGeo, ringMat);
+      ringH.rotation.x = Math.PI / 2;
+      group.add(ringH);
+
+      // Ground Drop Line (showing altitude)
+      const dropLineGeo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(0, -100, 0)
+      ]);
+      const dropLineMat = new THREE.LineDashedMaterial({
+        color: 0x64748b,
+        dashSize: 3,
+        gapSize: 2,
+        transparent: true,
+        opacity: 0.5,
+      });
+      const dropLine = new THREE.Line(dropLineGeo, dropLineMat);
+      dropLine.computeLineDistances();
+      group.add(dropLine);
+
+      // Vector arrows (dynamically updated)
+      const vPrefArrow = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, 0), 15, 0x00e5ff, 4, 2);
+      const vCmdArrow = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, 0), 15, 0xf97316, 4, 2);
+      const vActArrow = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, 0), 15, 0xeab308, 4, 2);
+      group.add(vPrefArrow);
+      group.add(vCmdArrow);
+      group.add(vActArrow);
+
+      // 3D Waypoint Beacon (Pulsating ring + vertical beam)
+      const wpGroup = new THREE.Group();
+      const wpRingGeo = new THREE.RingGeometry(6.0, 7.5, 24);
+      const wpRingMat = new THREE.MeshBasicMaterial({ color: colorHex, side: THREE.DoubleSide, transparent: true, opacity: 0.85 });
+      const wpRing = new THREE.Mesh(wpRingGeo, wpRingMat);
+      wpRing.rotation.x = Math.PI / 2;
+      wpGroup.add(wpRing);
+
+      const wpBeamGeo = new THREE.CylinderGeometry(0.25, 0.25, 120, 8);
+      const wpBeamMat = new THREE.MeshBasicMaterial({ color: colorHex, transparent: true, opacity: 0.25 });
+      const wpBeam = new THREE.Mesh(wpBeamGeo, wpBeamMat);
+      wpBeam.position.y = 60;
+      wpGroup.add(wpBeam);
+      scene.add(wpGroup);
+
+      // Dotted Guidance Line from Drone to Active Waypoint
+      const leadLineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, 0)]);
+      const leadLineMat = new THREE.LineDashedMaterial({ color: colorHex, dashSize: 4, gapSize: 3, transparent: true, opacity: 0.45 });
+      const leadLine = new THREE.Line(leadLineGeo, leadLineMat);
+      scene.add(leadLine);
+
+      return {
+        mesh: group,
+        rotors: rotors,
+        bubble: bubble,
+        ring: ringH,
+        dropLine: dropLine,
+        vPrefArrow: vPrefArrow,
+        vCmdArrow: vCmdArrow,
+        vActArrow: vActArrow,
+        trailPoints: [],
+        trailLine: null,
+        wpGroup: wpGroup,
+        wpRing: wpRing,
+        leadLine: leadLine,
+      };
+    }
+
+    // =========================================================================
+    // --- Corridor Graph Visualization (Strategic Layer) ---
+    // =========================================================================
+
+    // Storage for corridor tube meshes and node spheres
+    const corridorEdgeMeshes = {};  // edge_id → THREE.Mesh (tube)
+    const corridorNodeMeshes = {};  // node_id → THREE.Mesh (sphere)
+    let corridorLayerVisible = true;
+
+    // Altitude → colour mapping (matches strategic_planner.py levels)
+    function altitudeToColor(alt_m) {
+      if (alt_m <= 90)  return new THREE.Color(0x00e5ff); // 90 m  → cyan
+      if (alt_m <= 105) return new THREE.Color(0xf97316); // 105 m → orange
+      return new THREE.Color(0xa855f7);                   // other → purple
+    }
+
+    // NED → Three.js coordinate conversion
+    // NED: x=North, y=East, z=Down  →  THREE: X=East, Y=Altitude(up), Z=-North
+    function nedToThree(x, y, z) {
+      return new THREE.Vector3(y, -z, -x);
+    }
+
+    function renderCorridorGraph(data) {
+      if (!data || !data.edges) return;
+
+      // --- Draw/update edge tubes ---
+      data.edges.forEach(edge => {
+        const from = nedToThree(edge.from.x, edge.from.y, edge.from.z);
+        const to   = nedToThree(edge.to.x,   edge.to.y,   edge.to.z);
+
+        // Direction and length
+        const dir = new THREE.Vector3().subVectors(to, from);
+        const length = dir.length();
+        if (length < 0.1) return;
+
+        const color = altitudeToColor(edge.alt_m);
+
+        if (!corridorEdgeMeshes[edge.id]) {
+          // Create tube along edge
+          const mid = new THREE.Vector3().addVectors(from, to).multiplyScalar(0.5);
+          const geo = new THREE.CylinderGeometry(3.5, 3.5, length, 8, 1, false);
+          const mat = new THREE.MeshBasicMaterial({
+            color: color,
+            transparent: true,
+            opacity: 0.18,
+            side: THREE.DoubleSide,
+          });
+          const tube = new THREE.Mesh(geo, mat);
+
+          // Align tube along direction
+          const axis = new THREE.Vector3(0, 1, 0);
+          const normDir = dir.clone().normalize();
+          const quaternion = new THREE.Quaternion().setFromUnitVectors(axis, normDir);
+          tube.setRotationFromQuaternion(quaternion);
+          tube.position.copy(mid);
+          scene.add(tube);
+          corridorEdgeMeshes[edge.id] = tube;
+
+          // Wireframe outline on same tube
+          const wireMat = new THREE.MeshBasicMaterial({
+            color: color,
+            transparent: true,
+            opacity: 0.55,
+            wireframe: true,
+          });
+          const wireTube = new THREE.Mesh(geo.clone(), wireMat);
+          wireTube.setRotationFromQuaternion(quaternion);
+          wireTube.position.copy(mid);
+          scene.add(wireTube);
+          corridorEdgeMeshes[edge.id + '_wire'] = wireTube;
+
+          // Directional arrow at midpoint
+          const normDir2 = normDir.clone();
+          const arrowHelper = new THREE.ArrowHelper(normDir2, mid, 20, color.getHex(), 8, 4);
+          scene.add(arrowHelper);
+          corridorEdgeMeshes[edge.id + '_arrow'] = arrowHelper;
+        } else {
+          // Update color if altitude changed
+          corridorEdgeMeshes[edge.id].material.color.copy(color);
+          if (corridorEdgeMeshes[edge.id + '_wire'])
+            corridorEdgeMeshes[edge.id + '_wire'].material.color.copy(color);
+          if (corridorEdgeMeshes[edge.id + '_arrow'])
+            corridorEdgeMeshes[edge.id + '_arrow'].setColor(color.getHex());
+        }
+
+        // Visibility
+        const show = corridorLayerVisible;
+        ['', '_wire', '_arrow'].forEach(suffix => {
+          const m = corridorEdgeMeshes[edge.id + suffix];
+          if (m) m.visible = show;
+        });
+      });
+
+      // --- Draw/update node spheres ---
+      data.nodes.forEach(node => {
+        const pos = nedToThree(node.x, node.y, node.z);
+        if (!corridorNodeMeshes[node.id]) {
+          const isHub = node.id.startsWith('HUB');
+          const geo = new THREE.SphereGeometry(isHub ? 6 : 9, 12, 8);
+          const mat = new THREE.MeshBasicMaterial({
+            color: isHub ? 0xffffff : 0xffd700,
+            transparent: true,
+            opacity: 0.75,
+          });
+          const sphere = new THREE.Mesh(geo, mat);
+          sphere.position.copy(pos);
+          scene.add(sphere);
+          corridorNodeMeshes[node.id] = sphere;
+        } else {
+          corridorNodeMeshes[node.id].position.copy(pos);
+        }
+        corridorNodeMeshes[node.id].visible = corridorLayerVisible;
+      });
+    }
+
+    // Apply SIPP drone_plans overlay onto UAV telemetry cards (called from handleTelemetryTick)
+    let lastSippPlans = {};
+    function handleCorridorTelemetry(data) {
+      renderCorridorGraph(data);
+      lastSippPlans = data.drone_plans || {};
+    }
+
+    // --- State Storage ---
+    const uavs = {};
+    let cameraMode = 'orbit';
+    let isPaused = false;
+
+    const uavColorPalette = {
+      'UAV-01': 0x00e5ff, // Electric Cyan
+      'UAV-02': 0xf97316, // Bright Orange
+      'UAV-03': 0x10b981, // Emerald Green
+      'UAV-04': 0xef4444, // Crimson Red
+      'UAV-05': 0xa855f7, // Royal Purple
+      'UAV-06': 0xeab308, // Golden Yellow
+      'UAV-07': 0xec4899, // Hot Pink
+      'UAV-08': 0x06b6d4, // Sky Cyan
+      'UAV-09': 0x84cc16, // Lime Green
+      'UAV-10': 0x6366f1, // Indigo
+      'Ego':    0x00e5ff,
+    };
+
+    // --- 3D Flight Ribbon Trail ---
+    function updateTrail(uavObj, currentPos) {
+      if (!document.getElementById('layer-ribbons').checked) {
+        if (uavObj.trailLine) uavObj.trailLine.visible = false;
+        return;
+      }
+
+      uavObj.trailPoints.push(currentPos.clone());
+      if (uavObj.trailPoints.length > 120) {
+        uavObj.trailPoints.shift();
+      }
+
+      if (!uavObj.trailLine) {
+        const geo = new THREE.BufferGeometry().setFromPoints(uavObj.trailPoints);
+        const mat = new THREE.LineBasicMaterial({
+          color: uavColorPalette[uavObj.id] || 0x38bdf8,
+          transparent: true,
+          opacity: 0.6,
+          linewidth: 2,
+        });
+        uavObj.trailLine = new THREE.Line(geo, mat);
+        scene.add(uavObj.trailLine);
+      } else {
+        uavObj.trailLine.visible = true;
+        uavObj.trailLine.geometry.setFromPoints(uavObj.trailPoints);
+      }
+    }
+
+    // --- Server-Sent Events (SSE) Telemetry Ingestion ---
+    function connectTelemetryStream() {
+      const evtSource = new EventSource('/telemetry_stream');
+
+      evtSource.onopen = () => {
+        console.log('[3D Visualizer] Telemetry SSE stream connected.');
+      };
+
+      evtSource.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.type === 'corridor_telemetry') {
+            handleCorridorTelemetry(payload);
+          } else {
+            handleTelemetryTick(payload);
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      };
+
+      evtSource.onerror = (err) => {
+        console.warn('[3D Visualizer] SSE reconnecting...');
+      };
+    }
+
+    // --- Frame Update Logic ---
+    let anyConflictGlobal = false;
+
+    function handleTelemetryTick(data) {
+      if (isPaused) return;
+
+      const activeList = data.uavs || [];
+      anyConflictGlobal = false;
+
+      activeList.forEach((item) => {
+        const id = item.id;
+        if (!uavs[id]) {
+          const col = uavColorPalette[id] || 0x38bdf8;
+          uavs[id] = createQuadcopterMesh(col);
+          uavs[id].id = id;
+          scene.add(uavs[id].mesh);
+        }
+
+        const u = uavs[id];
+        // Coordinates: NED (x=North, y=East, z=Down) -> Three.js (X=East, Y=Alt, Z=-North)
+        const px = item.y;               // East
+        const py = -item.z;              // Altitude (positive up)
+        const pz = -item.x;              // -North (camera looks along -Z)
+
+        u.mesh.position.set(px, py, pz);
+
+        // Attitude Banking
+        // Roll around Z-axis (East motion), Pitch around X-axis (North motion), Yaw around Y-axis
+        const rollRad = THREE.MathUtils.degToRad(item.roll_deg || 0);
+        const pitchRad = THREE.MathUtils.degToRad(item.pitch_deg || 0);
+        const yawRad = THREE.MathUtils.degToRad(-(item.yaw_deg || 0) + 90);
+
+        u.mesh.rotation.order = 'YXZ';
+        u.mesh.rotation.y = yawRad;
+        u.mesh.rotation.x = pitchRad;
+        u.mesh.rotation.z = -rollRad;
+
+        // Propeller Spin
+        const phase = item.rotor_phase || 0;
+        u.rotors.forEach((r, idx) => {
+          r.rotation.y = (idx % 2 === 0 ? phase : -phase);
+        });
+
+        // Protective Bubble Separation Status
+        const inConflict = item.in_conflict || false;
+        if (inConflict) anyConflictGlobal = true;
+        const bubbleColor = inConflict ? 0xef4444 : (item.min_dist < 50.0 ? 0xf59e0b : 0x10b981);
+        u.bubble.material.color.setHex(bubbleColor);
+        u.ring.material.color.setHex(bubbleColor);
+        u.bubble.material.opacity = inConflict ? 0.35 : 0.12;
+
+        // Altitude Drop Line
+        const dropPoints = [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, -py, 0)];
+        u.dropLine.geometry.setFromPoints(dropPoints);
+        u.dropLine.computeLineDistances();
+
+        // 3D Velocity Vectors
+        const showVec = document.getElementById('layer-vectors').checked;
+        u.vPrefArrow.visible = showVec;
+        u.vCmdArrow.visible = showVec;
+        u.vActArrow.visible = showVec;
+
+        if (showVec) {
+          // Pref Vector (Cyan)
+          const vpx = item.vy_pref || 0;
+          const vpz = -(item.vx_pref || 0);
+          const vprefLen = Math.hypot(vpx, vpz);
+          if (vprefLen > 0.1) {
+            u.vPrefArrow.setDirection(new THREE.Vector3(vpx / vprefLen, 0, vpz / vprefLen));
+            u.vPrefArrow.setLength(vprefLen * 1.5, 3, 1.5);
+          }
+
+          // Cmd Vector (Orange)
+          const vcx = item.vy_cmd || 0;
+          const vcz = -(item.vx_cmd || 0);
+          const vcmdLen = Math.hypot(vcx, vcz);
+          if (vcmdLen > 0.1) {
+            u.vCmdArrow.setDirection(new THREE.Vector3(vcx / vcmdLen, 0, vcz / vcmdLen));
+            u.vCmdArrow.setLength(vcmdLen * 1.5, 3, 1.5);
+          }
+
+          // Act Vector (Yellow)
+          const vax = item.vy || 0;
+          const vaz = -(item.vx || 0);
+          const vactLen = Math.hypot(vax, vaz);
+          if (vactLen > 0.1) {
+            u.vActArrow.setDirection(new THREE.Vector3(vax / vactLen, 0, vaz / vactLen));
+            u.vActArrow.setLength(vactLen * 1.5, 3, 1.5);
+          }
+        }
+
+        // 3D Waypoint Beacon & Guidance Line
+        if (item.target_x !== undefined && u.wpGroup) {
+          const wpx = item.target_y;
+          const wpy = -item.target_z;
+          const wpz = -item.target_x;
+          u.wpGroup.position.set(wpx, 0, wpz);
+          u.wpRing.position.y = wpy;
+          u.wpRing.rotation.z += 0.03;
+
+          u.leadLine.geometry.setFromPoints([
+            new THREE.Vector3(px, py, pz),
+            new THREE.Vector3(wpx, wpy, wpz)
+          ]);
+          u.leadLine.computeLineDistances();
+        }
+
+        // 3D Ribbon Trail
+        updateTrail(u, new THREE.Vector3(px, py, pz));
+      });
+
+      // Update Global Status Badge
+      const badge = document.getElementById('global-status-badge');
+      if (anyConflictGlobal) {
+        badge.className = 'status-badge conflict';
+      } else {
+        badge.className = 'status-badge';
+      }
+
+      // Update Camera Tracking
+      const leadDrone = uavs['UAV-01'] || uavs['Ego'];
+      if (cameraMode === 'chase' && leadDrone) {
+        const dronePos = leadDrone.mesh.position;
+        const droneRotY = leadDrone.mesh.rotation.y;
+        const offset = new THREE.Vector3(
+          -Math.cos(droneRotY) * 60,
+          25,
+          Math.sin(droneRotY) * 60
+        );
+        camera.position.copy(dronePos).add(offset);
+        controls.target.copy(dronePos);
+      }
+
+      // Update UI Telemetry Tray
+      renderTelemetryCards(activeList);
+    }
+
+    function renderTelemetryCards(list) {
+      const tray = document.getElementById('telemetry-tray');
+      tray.innerHTML = '';
+
+      list.forEach(u => {
+        const card = document.createElement('div');
+        card.className = `uav-card ${u.in_conflict ? 'conflict' : ''}`;
+        card.style.borderLeftColor = uavColorPalette[u.id] ? `#${uavColorPalette[u.id].toString(16).padStart(6, '0')}` : '#00e5ff';
+
+        const speed = Math.hypot(u.vx, u.vy).toFixed(1);
+        const alt = (-u.z).toFixed(1);
+        const err = (u.tracking_error_ms || 0).toFixed(2);
+        const roll = (u.roll_deg || 0).toFixed(1);
+        const pitch = (u.pitch_deg || 0).toFixed(1);
+        const minDist = (u.min_dist || 999).toFixed(1);
+        const wpIdx = (u.wp_index !== undefined ? u.wp_index + 1 : 1);
+
+        const sippEdge = u.sipp_edge || 'E_--';
+        const sippLeg = u.sipp_leg || `${wpIdx}/4`;
+        const sippSpeed = (u.sipp_speed !== undefined ? u.sipp_speed.toFixed(1) : speed);
+        const missionType = u.mission_type || 'PATROL';
+
+        card.innerHTML = `
+          <div class="uav-card-header">
+            <span class="uav-id">${u.id === 'Ego' ? 'EGO (PX4 SITL)' : u.id} <span style="font-size: 10px; color: #a855f7;">[${missionType}]</span></span>
+            <span class="uav-mode">${u.in_conflict ? 'CONFLICT' : 'CLEAR'}</span>
+          </div>
+          <div class="telemetry-grid">
+            <div class="tel-item"><span>Corridor:</span><span class="tel-val" style="color: #00e5ff;">${sippEdge} (${sippLeg})</span></div>
+            <div class="tel-item"><span>Alt (Z):</span><span class="tel-val">${alt} m</span></div>
+            <div class="tel-item"><span>SIPP Spd:</span><span class="tel-val" style="color: #38bdf8;">${sippSpeed} m/s</span></div>
+            <div class="tel-item"><span>Phys Spd:</span><span class="tel-val">${speed} m/s</span></div>
+            <div class="tel-item"><span>Tracking Err:</span><span class="tel-val" style="color: ${err > 1.5 ? '#f59e0b' : '#10b981'};">${err} m/s</span></div>
+            <div class="tel-item"><span>Min Sep:</span><span class="tel-val" style="color: ${minDist < 25 ? '#ef4444' : (minDist < 50 ? '#f59e0b' : '#38bdf8')};">${minDist < 900 ? minDist + 'm' : 'CLEAR'}</span></div>
+            <div class="tel-item"><span>Bank (Roll):</span><span class="tel-val">${roll}&deg;</span></div>
+          </div>
+        `;
+        tray.appendChild(card);
+      });
+    }
+
+    // --- Camera View Functions ---
+    function setCameraView(mode) {
+      cameraMode = mode;
+      document.querySelectorAll('.control-panel .btn-group .hud-btn').forEach(b => b.classList.remove('active'));
+
+      if (mode === 'orbit') {
+        event.target.classList.add('active');
+        controls.enabled = true;
+        controls.target.set(0, 100, 0);
+        camera.position.set(0, 280, 420);
+      } else if (mode === 'chase') {
+        event.target.classList.add('active');
+        controls.enabled = false;
+      } else if (mode === 'top') {
+        event.target.classList.add('active');
+        controls.enabled = true;
+        controls.target.set(0, 0, 0);
+        camera.position.set(0, 650, 0.1);
+      } else if (mode === 'side') {
+        event.target.classList.add('active');
+        controls.enabled = true;
+        controls.target.set(0, 100, 0);
+        camera.position.set(550, 100, 0);
+      }
+    }
+
+    function toggleLayers() {
+      const showBubbles = document.getElementById('layer-bubbles').checked;
+      Object.values(uavs).forEach(u => {
+        u.bubble.visible = showBubbles;
+        u.ring.visible = showBubbles;
+      });
+
+      const showCorridors = document.getElementById('layer-corridors') ? document.getElementById('layer-corridors').checked : true;
+      corridorLayerVisible = showCorridors;
+      Object.values(corridorEdgeMeshes).forEach(m => { if (m) m.visible = showCorridors; });
+      Object.values(corridorNodeMeshes).forEach(m => { if (m) m.visible = showCorridors; });
+    }
+
+    function updatePhysicsParams() {
+      const tau = parseFloat(document.getElementById('param-tau').value);
+      const wind = parseFloat(document.getElementById('param-wind').value);
+      const accel = parseFloat(document.getElementById('param-accel').value);
+
+      document.getElementById('disp-tau').innerText = `${tau.toFixed(2)} s`;
+      document.getElementById('disp-wind').innerText = `${wind.toFixed(1)} m/s`;
+      document.getElementById('disp-accel').innerText = `${accel.toFixed(1)} m/s²`;
+
+      fetch('/api/params', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tau: tau, wind: wind, max_accel: accel }),
+      });
+    }
+
+    function resetScenario() {
+      fetch('/api/reset', { method: 'POST' });
+    }
+
+    function togglePause() {
+      isPaused = !isPaused;
+      document.getElementById('btn-pause').innerText = isPaused ? 'Resume Sim' : 'Pause Sim';
+      fetch('/api/pause', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused: isPaused }),
+      });
+    }
+
+    // --- Render Loop ---
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Start
+    fetch('/api/corridor_graph')
+      .then(res => res.json())
+      .then(data => handleCorridorTelemetry(data))
+      .catch(err => console.warn('[3D Visualizer] Initial corridor fetch error:', err));
+
+    connectTelemetryStream();
+    animate();
+  </script>
+</body>
+</html>

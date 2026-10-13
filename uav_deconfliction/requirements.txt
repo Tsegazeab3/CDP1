@@ -1,0 +1,34 @@
+# ==============================================================================
+# Multi-UAV Strategic & Tactical Deconfliction - Python Requirements
+# ==============================================================================
+
+# Core UTM & Multi-UAV Simulation
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+pandas>=2.0.0
+Pillow>=9.5.0
+pygame>=2.5.0
+pyproj>=3.5.0
+pyzmq>=25.0.0
+PyYAML>=6.0
+
+# 3D Web Flight Deck & Real-Time Telemetry Streaming
+Flask>=3.0.0
+Flask-SocketIO>=5.3.0
+simple-websocket>=1.1.0
+
+# Autopilot Interface & Air Traffic Simulation
+pymavlink>=2.4.30
+bluesky-simulator>=1.1.0
+
+# Build dependencies for C++ extensions
+Cython>=3.0.0
+setuptools>=65.0.0
+wheel>=0.40.0
+
+# Tactical Collision Avoidance (ORCA / RVO2)
+# Note: Python-RVO2 requires CMake and can be installed via:
+#   git clone https://github.com/sybrenstuvel/Python-RVO2.git /tmp/Python-RVO2
+#   sed -i 's/VERSION 2.8/VERSION 3.5/' /tmp/Python-RVO2/CMakeLists.txt
+#   pip install --no-build-isolation /tmp/Python-RVO2
