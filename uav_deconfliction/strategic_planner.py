@@ -422,6 +422,8 @@ class MissionPlan:
     hover_since: float = -1.0           # Sim time hovering started (-1 = not hovering)
     alt_violation_since: float = -1.0   # Sim time altitude violation started (-1 = none)
     layer_transition_until: float = -1.0  # Sim time when active layer transition completes (-1 = none)
+    origin_node: str = ""
+    destination_node: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -444,10 +446,36 @@ class CorridorGraph:
     temporal separation for drones sharing the same edge at different times.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, wind_vector: Tuple[float, float, float] = (1.2, -0.8, 0.0)) -> None:
         self.nodes: Dict[str, CorridorNode] = {}
         self.edges: Dict[str, CorridorEdge] = {}
         self._adj: Dict[str, List[str]] = {}  # from_node_id → [edge_id, ...]
+        self.wind_vector: Tuple[float, float, float] = wind_vector
+
+    def get_effective_ground_speed(
+        self,
+        edge: CorridorEdge,
+        airspeed: float,
+        wind_vector: Optional[Tuple[float, float, float]] = None,
+    ) -> float:
+        """
+        Calculates effective ground speed along edge direction considering wind (Tang et al. 2023).
+        v_ground = v_air + v_wind · d_hat
+        """
+        if wind_vector is None:
+            wind_vector = self.wind_vector
+        n_from = self.nodes[edge.from_id]
+        n_to   = self.nodes[edge.to_id]
+        dx = n_to.x - n_from.x
+        dy = n_to.y - n_from.y
+        dist_2d = math.hypot(dx, dy)
+        if dist_2d < 1e-3:
+            return max(0.5, airspeed)
+        ux = dx / dist_2d
+        uy = dy / dist_2d
+        w_proj = wind_vector[0] * ux + wind_vector[1] * uy
+        v_ground = airspeed + w_proj
+        return max(0.5, v_ground)
 
     def add_node(self, node: CorridorNode) -> None:
         self.nodes[node.id] = node
@@ -540,6 +568,7 @@ class CorridorGraph:
         num_drones: int = 10,
         perim_radius: float = 260.0,
         hub_radius: float = 110.0,
+        wind_vector: Tuple[float, float, float] = (1.2, -0.8, 0.0),
     ) -> Tuple["CorridorGraph", List[List[str]]]:
         """
         Builds the corridor graph matching the sim3d_server.py circular scenario
@@ -557,7 +586,7 @@ class CorridorGraph:
             E_{i}_C  HUB_OUT_{i}       → PERIM_{(i+5)%10}    (outbound departure)
             E_{i}_D  PERIM_{(i+5)%10}  → PERIM_{i}           (return patrol)
         """
-        g = cls()
+        g = cls(wind_vector=wind_vector)
         n_half = num_drones // 2
         routes: List[List[str]] = [[] for _ in range(num_drones)]
 
@@ -723,9 +752,15 @@ class SIPPPlanner:
     slots already committed by higher-priority ones.
     """
 
-    def __init__(self, graph: CorridorGraph, table: ReservationTable) -> None:
+    def __init__(
+        self,
+        graph: CorridorGraph,
+        table: ReservationTable,
+        wind_vector: Tuple[float, float, float] = (1.2, -0.8, 0.0),
+    ) -> None:
         self.graph = graph
         self.table = table
+        self.wind_vector = wind_vector
 
     # ---- Utility --------------------------------------------------------
 
@@ -770,7 +805,7 @@ class SIPPPlanner:
             f_cost=h0, g_cost=earliest_start,
             node_id=start_node, path_legs=[],
         ))
-        visited: Dict[str, float] = {}
+        visited: Dict[Tuple[str, float, float], float] = {}
 
         d_prefix = None
         try:
@@ -792,22 +827,21 @@ class SIPPPlanner:
                     legs=cur.path_legs,
                 )
 
-            if cur.node_id in visited and visited[cur.node_id] <= cur.g_cost:
-                continue
-            visited[cur.node_id] = cur.g_cost
-
             for edge in self.graph.neighbors(cur.node_id):
                 if d_prefix and not edge.id.startswith(d_prefix):
                     continue
-                for speed in self._sample_speeds(edge, speed_candidates):
+                for airspeed in self._sample_speeds(edge, speed_candidates):
+                    speed = self.graph.get_effective_ground_speed(edge, airspeed, self.wind_vector)
                     trav = edge.length / speed
                     for t_start, t_end in self.table.get_safe_intervals(edge.id, trav, cur.g_cost):
                         depart = max(t_start, cur.g_cost)
                         if depart > t_end:
                             continue
                         arrive = depart + trav
-                        if edge.to_id in visited and visited[edge.to_id] <= arrive:
+                        interval_key = (edge.to_id, t_start, t_end)
+                        if interval_key in visited and visited[interval_key] <= arrive:
                             continue
+                        visited[interval_key] = arrive
 
                         leg = MissionLeg(
                             edge_id=edge.id,
@@ -820,10 +854,6 @@ class SIPPPlanner:
                             node_id=edge.to_id,
                             path_legs=cur.path_legs + [leg],
                         ))
-                        break  # Only take the first (earliest) safe interval per speed/edge
-                    else:
-                        continue
-                    break  # Found a valid speed; stop iterating speeds for this edge
 
         return None  # No conflict-free path found
 
@@ -839,10 +869,12 @@ class SIPPPlanner:
         climb_rate: float,
     ) -> Optional[Tuple[float, List[MissionLeg]]]:
         """
-        Schedules a candidate corridor route across continuous time.
-        Computes the earliest departure time t_dep >= desired_departure
-        such that all legs and vertical transition columns are conflict-free.
-        Any intermediate slot occupation shifts departure back to the ground pad.
+        Schedules a candidate corridor route across continuous time using True Variable-Speed SIPP.
+        Computes the earliest departure time t_dep >= desired_departure such that all legs
+        and vertical transition columns are conflict-free.
+        When downstream legs/hub slots are busy, approach/preceding legs absorb delay by flying
+        slower (between min and max cruise speed), falling back to ground pad delay only when
+        minimum speed is still too fast.
         """
         t_dep = desired_departure
         max_attempts = 150
@@ -859,7 +891,8 @@ class SIPPPlanner:
             for k, eid in enumerate(route_edge_ids):
                 edge = self.graph.edges[eid]
                 assigned_alt = layer_per_edge[k]
-                trav_speed = min(edge.max_speed_ms, max(edge.min_speed_ms, nominal_speed))
+                nominal_airspeed = min(edge.max_speed_ms, max(edge.min_speed_ms, nominal_speed))
+                trav_speed = self.graph.get_effective_ground_speed(edge, nominal_airspeed, self.wind_vector)
                 trav_time = edge.length / trav_speed
 
                 v_dur = 0.0
@@ -881,10 +914,35 @@ class SIPPPlanner:
                             trans_rid, v_dur, v_start, alt_m=v_center, alt_band_m=v_band, is_vertical=True, drone_id=drone_id
                         )
                         next_avail = intervals[0][0]
-                        delay = max(0.5, next_avail - v_start)
-                        t_dep += delay
-                        conflict_found = True
-                        break
+                        needed_delay = max(0.5, next_avail - v_start)
+
+                        # Variable-Speed SIPP: absorb delay by slowing down preceding leg(s)
+                        if k > 0 and legs_tentative:
+                            prev_leg = legs_tentative[-1]
+                            prev_edge = self.graph.edges[prev_leg.edge_id]
+                            min_g_spd = self.graph.get_effective_ground_speed(prev_edge, prev_edge.min_speed_ms, self.wind_vector)
+                            max_dur = prev_edge.length / min_g_spd
+                            curr_dur = prev_leg.arrive_time - prev_leg.depart_time
+                            absorbable = max(0.0, max_dur - curr_dur)
+                            if absorbable > 0.1:
+                                absorb_dt = min(needed_delay, absorbable)
+                                cand_arrive = prev_leg.arrive_time + absorb_dt
+                                if self.table.is_free(
+                                    prev_leg.edge_id, prev_leg.depart_time, cand_arrive,
+                                    alt_m=prev_leg.alt_m, alt_band_m=prev_edge.alt_band_m,
+                                    is_vertical=False, drone_id=drone_id
+                                ):
+                                    prev_leg.arrive_time = cand_arrive
+                                    prev_leg.speed = prev_edge.length / (cand_arrive - prev_leg.depart_time)
+                                    needed_delay -= absorb_dt
+                                    current_time = cand_arrive
+                                    v_start = current_time
+                                    v_end = current_time + v_dur
+
+                        if needed_delay > 0.05:
+                            t_dep += needed_delay
+                            conflict_found = True
+                            break
                     current_time = v_end
 
                 # Horizontal corridor edge reservation
@@ -897,10 +955,35 @@ class SIPPPlanner:
                         eid, trav_time, h_start, alt_m=assigned_alt, alt_band_m=edge.alt_band_m, is_vertical=False, drone_id=drone_id
                     )
                     next_avail = intervals[0][0]
-                    delay = max(0.5, next_avail - h_start)
-                    t_dep += delay
-                    conflict_found = True
-                    break
+                    needed_delay = max(0.5, next_avail - h_start)
+
+                    # Variable-Speed SIPP: slow down approach / preceding leg to arrive when slot opens
+                    if k > 0 and legs_tentative:
+                        prev_leg = legs_tentative[-1]
+                        prev_edge = self.graph.edges[prev_leg.edge_id]
+                        min_g_spd = self.graph.get_effective_ground_speed(prev_edge, prev_edge.min_speed_ms, self.wind_vector)
+                        max_dur = prev_edge.length / min_g_spd
+                        curr_dur = prev_leg.arrive_time - prev_leg.depart_time
+                        absorbable = max(0.0, max_dur - curr_dur)
+                        if absorbable > 0.1:
+                            absorb_dt = min(needed_delay, absorbable)
+                            cand_arrive = prev_leg.arrive_time + absorb_dt
+                            if self.table.is_free(
+                                prev_leg.edge_id, prev_leg.depart_time, cand_arrive,
+                                alt_m=prev_leg.alt_m, alt_band_m=prev_edge.alt_band_m,
+                                is_vertical=False, drone_id=drone_id
+                            ):
+                                prev_leg.arrive_time = cand_arrive
+                                prev_leg.speed = prev_edge.length / (cand_arrive - prev_leg.depart_time)
+                                needed_delay -= absorb_dt
+                                current_time = cand_arrive
+                                h_start = current_time
+                                h_end = current_time + trav_time
+
+                    if needed_delay > 0.05:
+                        t_dep += needed_delay
+                        conflict_found = True
+                        break
 
                 fn = self.graph.nodes[edge.from_id]
                 tn = self.graph.nodes[edge.to_id]
@@ -1011,6 +1094,8 @@ class SIPPPlanner:
             scheduled_departure=best_dep,
             ground_delay_s=best_dep - req.desired_departure_time,
             is_authorized=True,
+            origin_node=req.origin_node,
+            destination_node=req.destination_node,
         )
 
     # ---- Loop route SIPP (pre-determined edge sequence) ----------------
@@ -1049,7 +1134,8 @@ class SIPPPlanner:
             edge = self.graph.edges[edge_id]
             scheduled = False
 
-            for speed in self._sample_speeds(edge, speed_candidates):
+            for airspeed in self._sample_speeds(edge, speed_candidates):
+                speed = self.graph.get_effective_ground_speed(edge, airspeed, self.wind_vector)
                 trav = edge.length / speed
                 for t_start, t_end in self.table.get_safe_intervals(edge_id, trav, t_current, alt_m=edge.alt_m, alt_band_m=edge.alt_band_m, drone_id=drone_id):
                     depart = max(t_start, t_current)
@@ -1126,13 +1212,15 @@ class StrategicController:
         safety_buffer_s: float = SAFETY_BUFFER_S,
         hover_timeout_s: float = HOVER_TIMEOUT_S,
         alt_violation_hold_s: float = ALT_VIOLATION_HOLD_S,
+        wind_vector: Tuple[float, float, float] = (1.2, -0.8, 0.0),
     ) -> None:
+        self.wind_vector = wind_vector
         self.graph, self._default_routes = CorridorGraph.build_circular_scenario(
-            num_drones=num_drones
+            num_drones=num_drones, wind_vector=wind_vector
         )
         self.conflict_map = self.graph.build_conflict_map()
         self.table = ReservationTable(safety_buffer_s=safety_buffer_s, conflict_map=self.conflict_map)
-        self.planner = SIPPPlanner(self.graph, self.table)
+        self.planner = SIPPPlanner(self.graph, self.table, wind_vector=wind_vector)
         self.plans: Dict[str, MissionPlan] = {}
 
         self.hover_timeout_s      = hover_timeout_s
@@ -1141,6 +1229,7 @@ class StrategicController:
         # drone_id → list of edge IDs for its default loop
         self._route_map: Dict[str, List[str]] = {}
         self._num_drones = num_drones
+        self.scenario_mode = "benchmark"
 
     # ---- Initialization ------------------------------------------------
 
@@ -1157,11 +1246,13 @@ class StrategicController:
 
         A small stagger (0.5 s per drone) prevents simultaneous hub entry.
         """
+        self.scenario_mode = "benchmark"
         mission_types = mission_types or {}
 
         # Reset state
+        self.conflict_map = self.graph.build_conflict_map()
         self.table   = ReservationTable(safety_buffer_s=self.table.safety_buffer, conflict_map=self.conflict_map)
-        self.planner = SIPPPlanner(self.graph, self.table)
+        self.planner = SIPPPlanner(self.graph, self.table, wind_vector=self.wind_vector)
         self.plans.clear()
         self._route_map.clear()
 
@@ -1207,6 +1298,128 @@ class StrategicController:
                 )
             else:
                 print(f"[StrategicPlanner] ⚠ FAS Rejected authorization for {drone_id} — holding position.")
+
+    def initialize_random_scenario(
+        self,
+        drone_ids: List[str],
+        sim_time: float = 0.0,
+        seed: Optional[int] = None,
+    ) -> Dict[str, Tuple[str, str]]:
+        """
+        Plans initial SIPP missions with randomized origins and destinations
+        across the corridor graph. Each drone is assigned a random station-to-station
+        mission (e.g. PERIM_i -> PERIM_j), computing shortest graph routes and
+        conflict-free 4D departure schedules with SIPP.
+        """
+        import random
+        rng = random.Random(seed)
+        self.scenario_mode = "random"
+
+        self.conflict_map = self.graph.build_conflict_map()
+        self.table   = ReservationTable(safety_buffer_s=self.table.safety_buffer, conflict_map=self.conflict_map)
+        self.planner = SIPPPlanner(self.graph, self.table, wind_vector=self.wind_vector)
+        self.plans.clear()
+        self._route_map.clear()
+
+        perim_nodes = [f"PERIM_{i}" for i in range(self._num_drones)]
+        od_pairs: Dict[str, Tuple[str, str]] = {}
+
+        # Shuffle origins to spread drones across stations
+        shuffled_origins = list(perim_nodes)
+        rng.shuffle(shuffled_origins)
+
+        for i, drone_id in enumerate(drone_ids):
+            orig = shuffled_origins[i % len(shuffled_origins)]
+            # Destination must be different from origin
+            possible_dests = [n for n in perim_nodes if n != orig]
+            dest = rng.choice(possible_dests)
+            od_pairs[drone_id] = (orig, dest)
+
+            route = self.graph.shortest_path(orig, dest)
+            self._route_map[drone_id] = route
+
+            mtype = rng.choice([MissionType.EMERGENCY, MissionType.DELIVERY, MissionType.SURVEY, MissionType.PATROL])
+            # Stagger departures slightly so takeoffs are sequential
+            earliest = sim_time + i * 1.0
+
+            req = FlightAuthorisationRequest(
+                drone_id=drone_id,
+                origin_node=orig,
+                destination_node=dest,
+                desired_departure_time=earliest,
+                cruise_speed=rng.uniform(10.0, 14.0),
+                climb_rate=2.5,
+                descent_rate=2.5,
+                mission_type=mtype,
+                route_edges=route,
+            )
+
+            plan = self.planner.plan_preflight_mission(req)
+            if plan is not None:
+                self.planner.commit(plan)
+                self.plans[drone_id] = plan
+                print(
+                    f"[StrategicPlanner] [RANDOM FAS AUTHORIZED] {drone_id:10s} ({MissionType.name(mtype):9s}) │ "
+                    f"{orig} → {dest} │ {len(plan.legs)} legs │ "
+                    f"sched_dep t={plan.scheduled_departure:.1f}s"
+                )
+            else:
+                print(f"[StrategicPlanner] ⚠ FAS Rejected authorization for {drone_id} ({orig} -> {dest})")
+
+        return od_pairs
+
+    def dispatch_next_random_mission(
+        self,
+        drone_id: str,
+        current_node_id: str,
+        sim_time: float,
+    ) -> bool:
+        """
+        Dynamically dispatches a new random destination mission for a drone that has
+        arrived at its previous destination station.
+        """
+        import random
+        perim_nodes = [f"PERIM_{i}" for i in range(self._num_drones)]
+        candidate_dests = [n for n in perim_nodes if n != current_node_id]
+        if not candidate_dests:
+            return False
+
+        dest_node = random.choice(candidate_dests)
+        route = self.graph.shortest_path(current_node_id, dest_node)
+        if not route:
+            return False
+
+        mtype = random.choice([MissionType.EMERGENCY, MissionType.DELIVERY, MissionType.SURVEY, MissionType.PATROL])
+        cruise_spd = random.uniform(10.0, 14.0)
+
+        # Clear past completed reservations for this drone before scheduling next mission
+        self.table.release(drone_id)
+
+        req = FlightAuthorisationRequest(
+            drone_id=drone_id,
+            origin_node=current_node_id,
+            destination_node=dest_node,
+            desired_departure_time=sim_time + 0.5,
+            cruise_speed=cruise_spd,
+            climb_rate=2.5,
+            descent_rate=2.5,
+            mission_type=mtype,
+            route_edges=route,
+        )
+
+        plan = self.planner.plan_preflight_mission(req)
+        if plan is not None:
+            self.planner.commit(plan)
+            self.plans[drone_id] = plan
+            self._route_map[drone_id] = route
+            print(
+                f"[StrategicPlanner] [CONTINUOUS RANDOM DISPATCH] {drone_id} arrived at {current_node_id} "
+                f"→ New destination: {dest_node} ({len(plan.legs)} legs, sched_dep={plan.scheduled_departure:.1f}s)"
+            )
+            return True
+        else:
+            print(f"[StrategicPlanner] ⚠ Unable to dispatch continuous mission for {drone_id} from {current_node_id} to {dest_node}")
+            return False
 
     # ---- Layer / Altitude Calculation at Set Points -------------------
 
@@ -1323,57 +1536,30 @@ class StrategicController:
         edge     = self.graph.edges[leg.edge_id]
         tgt_node = self.graph.nodes[edge.to_id]
 
-        # ---- Waypoint Arrival Detection: Purely advance 4D waypoint sequence without in-flight replan ----
-        dist_2d = math.hypot(tgt_node.x - pos[0], tgt_node.y - pos[1])
-        if dist_2d < ARRIVAL_RADIUS_M:
-            plan.current_leg = (plan.current_leg + 1) % len(plan.legs)
-            leg_idx  = plan.current_leg % len(plan.legs)
+        # ---- Waypoint Arrival Detection (3D Euclidean Distance) ----
+        # Using 3D distance prevents advancing waypoints while the drone is still
+        # climbing or descending through an intermediate vertical transition band.
+        dist_3d = math.hypot(tgt_node.x - pos[0], tgt_node.y - pos[1], -leg.alt_m - pos[2])
+        if dist_3d < ARRIVAL_RADIUS_M:
+            if getattr(self, "scenario_mode", "benchmark") == "random" and plan.current_leg >= len(plan.legs) - 1:
+                # Reached final destination of current random mission! Dynamically dispatch next mission
+                self.dispatch_next_random_mission(drone_id, tgt_node.id, sim_time)
+                plan = self.plans.get(drone_id)
+                if plan is None or not plan.legs:
+                    return pos[0], pos[1], pos[2], 0.0
+                leg_idx = 0
+            else:
+                plan.current_leg = (plan.current_leg + 1) % len(plan.legs)
+                leg_idx  = plan.current_leg % len(plan.legs)
+
             leg      = plan.legs[leg_idx]
             edge     = self.graph.edges[leg.edge_id]
             tgt_node = self.graph.nodes[edge.to_id]
 
-        # ---- Off-nominal Contingency Trigger 1: Altitude Band Violation -------------------------
-        assigned_z = -leg.alt_m
-        z_error    = abs(pos[2] - assigned_z)
-        in_scheduled_transition = (leg.is_vertical_transition and sim_time <= leg.vertical_transition_end + 1.0)
-        is_transitioning = in_scheduled_transition or (plan.layer_transition_until > sim_time)
-        if is_transitioning:
-            # Within active layer change transition period: clear violation timer
-            if z_error <= edge.alt_band_m:
-                plan.layer_transition_until = -1.0
-            plan.alt_violation_since = -1.0
-        elif z_error > edge.alt_band_m:
-            if plan.alt_violation_since < 0:
-                plan.alt_violation_since = sim_time
-            elif sim_time - plan.alt_violation_since >= self.alt_violation_hold_s:
-                plan.alt_violation_since = -1.0
-                self._replan(drone_id, sim_time, reason="ALT_VIOLATION", current_pos=pos)
-                plan     = self.plans.get(drone_id)
-                if plan is None or not plan.legs:
-                    return pos[0], pos[1], pos[2], 0.0
-                leg_idx  = plan.current_leg % len(plan.legs)
-                leg      = plan.legs[leg_idx]
-                edge     = self.graph.edges[leg.edge_id]
-                tgt_node = self.graph.nodes[edge.to_id]
-        else:
-            plan.alt_violation_since = -1.0
-
-        # ---- Off-nominal Contingency Trigger 2: Hover Timeout (only when airborne) -------------
-        if vel_magnitude < HOVER_SPEED_THRESHOLD and sim_time >= plan.scheduled_departure:
-            if plan.hover_since < 0:
-                plan.hover_since = sim_time
-            elif sim_time - plan.hover_since >= self.hover_timeout_s:
-                plan.hover_since = -1.0
-                self._replan(drone_id, sim_time, reason="HOVER_TIMEOUT", current_pos=pos)
-                plan     = self.plans.get(drone_id)
-                if plan is None or not plan.legs:
-                    return pos[0], pos[1], pos[2], 0.0
-                leg_idx  = plan.current_leg % len(plan.legs)
-                leg      = plan.legs[leg_idx]
-                edge     = self.graph.edges[leg.edge_id]
-                tgt_node = self.graph.nodes[edge.to_id]
-        else:
-            plan.hover_since = -1.0
+        # Note: In accordance with Barrado et al. (2026), strategic replanning triggers
+        # (ALT_VIOLATION and HOVER_TIMEOUT) are omitted here to protect the integrity
+        # of the pre-flight reservation table during flight. Layer 2 (ORCA) and velocity
+        # controls handle transient tactical deviations without wiping reservations.
 
         return tgt_node.x, tgt_node.y, -leg.alt_m, leg.speed
 
@@ -1442,11 +1628,6 @@ class StrategicController:
             current_alt=current_alt,
         )
 
-        # Update candidate edge altitudes in graph before planning
-        for eid, edge in self.graph.edges.items():
-            if edge.from_id == start_node:
-                edge.alt_m = new_layer
-
         # 1. Dynamic Network Recalculation across full corridor graph
         new_plan = self.planner.plan(
             drone_id=drone_id,
@@ -1494,8 +1675,6 @@ class StrategicController:
                     idx_in_loop = i
                     break
             remaining = default_edges[idx_in_loop:] + default_edges[:idx_in_loop]
-            if remaining and remaining[0] in self.graph.edges:
-                self.graph.edges[remaining[0]].alt_m = new_layer
             new_plan = self.planner.plan_loop(
                 drone_id=drone_id,
                 route_edge_ids=remaining,
@@ -1504,13 +1683,13 @@ class StrategicController:
             )
 
         if new_plan is not None and new_plan.legs:
-            # Apply calculated layer to the leg(s)
+            # Apply calculated layer strictly to the drone's mission leg(s)
+            # (CorridorGraph edges remain read-only and unmutated across drones)
             for leg in new_plan.legs:
                 if leg.edge_id in self.graph.edges:
                     e = self.graph.edges[leg.edge_id]
                     if e.from_id == start_node or "HUB_IN" in start_node:
                         leg.alt_m = new_layer
-                        e.alt_m = new_layer
 
             if abs(new_layer - current_alt) > 1.0:
                 new_plan.layer_transition_until = sim_time + abs(new_layer - current_alt) / 1.5 + 2.5
@@ -1574,11 +1753,14 @@ class StrategicController:
                 "arrive_t":     round(leg.arrive_time, 2),
                 "leg_index":    li,
                 "total_legs":   len(plan.legs),
+                "origin":       getattr(plan, "origin_node", ""),
+                "destination":  getattr(plan, "destination_node", ""),
             }
 
         return {
             "type":          "corridor_telemetry",
             "sim_time":      round(sim_time, 2),
+            "scenario_mode": getattr(self, "scenario_mode", "benchmark"),
             "nodes":         nodes_out,
             "edges":         edges_out,
             "drone_plans":   drone_plans_out,
@@ -1591,10 +1773,11 @@ class StrategicController:
     def reset(self, num_drones: int = 10, sim_time: float = 0.0) -> None:
         """Full reset: rebuilds graph, clears table and plans."""
         self.graph, self._default_routes = CorridorGraph.build_circular_scenario(
-            num_drones=num_drones
+            num_drones=num_drones, wind_vector=self.wind_vector
         )
-        self.table   = ReservationTable(safety_buffer_s=self.table.safety_buffer)
-        self.planner = SIPPPlanner(self.graph, self.table)
+        self.conflict_map = self.graph.build_conflict_map()
+        self.table   = ReservationTable(safety_buffer_s=self.table.safety_buffer, conflict_map=self.conflict_map)
+        self.planner = SIPPPlanner(self.graph, self.table, wind_vector=self.wind_vector)
         self.plans.clear()
         self._route_map.clear()
         self._num_drones = num_drones

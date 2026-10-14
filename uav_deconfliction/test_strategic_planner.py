@@ -209,30 +209,46 @@ class TestStrategicController(unittest.TestCase):
         self.assertIsNotNone(plan_after)
         self.assertEqual(plan_after.current_leg, 1)
 
-    def test_altitude_violation_trigger(self):
+    def test_altitude_deviation_handled_without_midflight_replan(self):
+        """Assert altitude deviation does not wipe reservations or trigger mid-flight A* replan (Barrado et al. 2026)."""
         plan = self.controller.plans["UAV-01"]
-        # Normal query
-        self.controller.get_current_target("UAV-01", (200.0, 0.0, -90.0), 10.0, sim_time=1.0)
-        self.assertEqual(plan.alt_violation_since, -1.0)
-
         # Significant altitude deviation (e.g. at -50m instead of -90m: diff 40m > 8m band)
-        self.controller.get_current_target("UAV-01", (200.0, 0.0, -50.0), 10.0, sim_time=2.0)
-        self.assertAlmostEqual(plan.alt_violation_since, 2.0)
+        tx, ty, tz, spd = self.controller.get_current_target("UAV-01", (200.0, 0.0, -50.0), 10.0, sim_time=2.0)
+        # Reservation table and mission plan remain intact and authoritative
+        self.assertIn("UAV-01", self.controller.plans)
+        self.assertEqual(len(self.controller.plans["UAV-01"].legs), len(plan.legs))
+        self.assertGreater(len(self.controller.table._table), 0)
 
-        # After holding violation > ALT_VIOLATION_HOLD_S (e.g. 2.1s later at t=4.2s)
-        self.controller.get_current_target("UAV-01", (200.0, 0.0, -50.0), 10.0, sim_time=4.2)
-        # Should have reset violation timer after triggering replan
-        self.assertEqual(self.controller.plans["UAV-01"].alt_violation_since, -1.0)
-
-    def test_hover_timeout_trigger(self):
+    def test_hover_deviation_handled_without_midflight_replan(self):
+        """Assert temporary hover does not wipe reservations or trigger mid-flight A* replan (Barrado et al. 2026)."""
         plan = self.controller.plans["UAV-01"]
-        # Drone stops (< 0.5 m/s)
-        self.controller.get_current_target("UAV-01", (200.0, 0.0, -90.0), vel_magnitude=0.1, sim_time=1.0)
-        self.assertAlmostEqual(plan.hover_since, 1.0)
+        # Drone stops or hovers (< 0.5 m/s)
+        tx, ty, tz, spd = self.controller.get_current_target("UAV-01", (200.0, 0.0, -90.0), vel_magnitude=0.1, sim_time=9.5)
+        # Reservation table and mission plan remain intact and authoritative
+        self.assertIn("UAV-01", self.controller.plans)
+        self.assertEqual(len(self.controller.plans["UAV-01"].legs), len(plan.legs))
+        self.assertGreater(len(self.controller.table._table), 0)
 
-        # After holding hover > HOVER_TIMEOUT_S (8s later at t=9.5s)
-        self.controller.get_current_target("UAV-01", (200.0, 0.0, -90.0), vel_magnitude=0.1, sim_time=9.5)
-        self.assertEqual(self.controller.plans["UAV-01"].hover_since, -1.0)
+    def test_reset_preserves_conflict_map(self):
+        """Assert reset() properly retains conflict_map preventing mid-air collisions."""
+        self.controller.reset(num_drones=10)
+        self.assertIsNotNone(self.controller.table.conflict_map)
+        self.assertGreater(len(self.controller.table.conflict_map), 0)
+        # Verify hub crossing conflict mapping exists
+        self.assertIn("E_0_B", self.controller.table.conflict_map)
+        # Verify vertical transition column conflict mapping exists
+        self.assertIn("TRANS_PERIM_0", self.controller.table.conflict_map)
+
+    def test_wind_aware_effective_ground_speed(self):
+        """Assert Tang et al. (2023) effective ground speed calculation along edges with wind."""
+        edge = self.controller.graph.edges["E_0_A"]
+        # In circular scenario, E_0_A points inbound toward the center
+        # Test tailwind along edge direction
+        v_ground_nominal = self.controller.graph.get_effective_ground_speed(edge, 12.0)
+        self.assertGreater(v_ground_nominal, 0.5)
+        # Zero wind should yield exact airspeed
+        v_ground_zero_wind = self.controller.graph.get_effective_ground_speed(edge, 12.0, wind_vector=(0.0, 0.0, 0.0))
+        self.assertAlmostEqual(v_ground_zero_wind, 12.0, places=2)
 
     def test_corridor_telemetry_export(self):
         telem = self.controller.get_corridor_telemetry(sim_time=2.5)
@@ -431,6 +447,40 @@ class TestStrategicUTMPreFlightFAS(unittest.TestCase):
         # After vertical transition ends plus safety buffer (> 27.0s), intermediate layer is free
         free_after = controller.table.is_free("E_0_A", t_entry=28.0, t_exit=35.0, alt_m=105.0)
         self.assertTrue(free_after, "Intermediate layer must be free after vertical transition completes!")
+
+    def test_random_scenario_initialization(self):
+        """Assert initialize_random_scenario generates valid random station-to-station missions."""
+        controller = StrategicController(num_drones=10)
+        drone_ids = [f"UAV-{i+1:02d}" for i in range(10)]
+        od_pairs = controller.initialize_random_scenario(drone_ids, sim_time=0.0, seed=42)
+
+        self.assertEqual(len(od_pairs), 10)
+        self.assertEqual(controller.scenario_mode, "random")
+
+        for uid, (orig, dest) in od_pairs.items():
+            self.assertNotEqual(orig, dest, f"{uid} origin and destination should be distinct")
+            plan = controller.plans.get(uid)
+            self.assertIsNotNone(plan, f"Plan should exist for {uid}")
+            self.assertTrue(plan.is_authorized, f"Plan should be FAS authorized for {uid}")
+            self.assertGreater(len(plan.legs), 0, f"Plan should have legs for {uid}")
+            self.assertEqual(plan.origin_node, orig)
+            self.assertEqual(plan.destination_node, dest)
+
+    def test_continuous_random_dispatch(self):
+        """Assert arriving at a destination dynamically dispatches a new random destination."""
+        controller = StrategicController(num_drones=4)
+        drone_ids = [f"UAV-{i+1:02d}" for i in range(4)]
+        od_pairs = controller.initialize_random_scenario(drone_ids, sim_time=0.0, seed=123)
+
+        uav1_orig, uav1_dest = od_pairs["UAV-01"]
+        # Simulate reaching destination station
+        dispatched = controller.dispatch_next_random_mission("UAV-01", current_node_id=uav1_dest, sim_time=150.0)
+        self.assertTrue(dispatched, "Continuous dispatch should successfully authorize next mission")
+
+        new_plan = controller.plans["UAV-01"]
+        self.assertEqual(new_plan.origin_node, uav1_dest)
+        self.assertNotEqual(new_plan.destination_node, uav1_dest)
+        self.assertGreaterEqual(new_plan.scheduled_departure, 150.0)
 
 
 if __name__ == "__main__":

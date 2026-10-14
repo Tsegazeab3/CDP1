@@ -78,7 +78,7 @@ class Simulation3DCore:
         self.dispatcher = MAVLinkOffboardDispatcher(connection_url=mavlink_url)
 
         # Strategic 4D SIPP planner — Layer 1 above ORCA tactical layer
-        self.strategic = StrategicController(num_drones=10)
+        self.strategic = StrategicController(num_drones=10, wind_vector=self.physics.steady_wind)
 
         # UAV State Store & Multi-Waypoint Flight Plans
         self.uavs: Dict[str, DynamicUAVState] = {}
@@ -87,83 +87,127 @@ class Simulation3DCore:
         # Sim control
         self.paused = False
         self.sim_time = 0.0
+        self.scenario_mode = "benchmark"
         self.lock = threading.Lock()
-        self.init_scenario()
+        self.init_scenario(mode="benchmark")
 
-    def init_scenario(self, num_drones: int = 10, radius: float = 260.0):
+    def init_scenario(
+        self,
+        num_drones: int = 10,
+        radius: float = 260.0,
+        mode: Optional[str] = None,
+        seed: Optional[int] = None,
+    ):
         """
         Initialises 10 drones with SIPP-planned 4D spacetime corridor routes.
-
-        Layer 1 (Strategic): SIPP assigns each drone a conflict-free
-          (departure_time, cruise_speed) per corridor edge in the CorridorGraph.
-        Layer 2 (Tactical): Python-RVO2 ORCA reacts at 10 Hz within corridors.
-        Layer 3 (Physical): 6-DOF quadcopter dynamics (motor lag, wind gusts).
-
-        Altitude is layered: even drones at 90 m, odd drones at 105 m (NED z = -alt).
+        Supports:
+          - 'benchmark': Fixed symmetric circular antipodal hub-crossing loop.
+          - 'random': Dynamic randomized origin-to-destination missions across stations.
         """
-        with self.lock:
-            self.uavs.clear()
-            self.uav_waypoint_routes.clear()
+        if mode is not None:
+            self.scenario_mode = mode
+        elif not hasattr(self, "scenario_mode"):
+            self.scenario_mode = "benchmark"
 
-            colors = [
-                "#00e5ff",  # 1: Electric Cyan
-                "#f97316",  # 2: Bright Orange
-                "#10b981",  # 3: Emerald Green
-                "#ef4444",  # 4: Crimson Red
-                "#a855f7",  # 5: Royal Purple
-                "#eab308",  # 6: Golden Yellow
-                "#ec4899",  # 7: Hot Pink
-                "#06b6d4",  # 8: Sky Cyan
-                "#84cc16",  # 9: Lime Green
-                "#6366f1",  # 10: Indigo
-            ]
+        colors = [
+            "#00e5ff",  # 1: Electric Cyan
+            "#f97316",  # 2: Bright Orange
+            "#10b981",  # 3: Emerald Green
+            "#ef4444",  # 4: Crimson Red
+            "#a855f7",  # 5: Royal Purple
+            "#eab308",  # 6: Golden Yellow
+            "#ec4899",  # 7: Hot Pink
+            "#06b6d4",  # 8: Sky Cyan
+            "#84cc16",  # 9: Lime Green
+            "#6366f1",  # 10: Indigo
+        ]
 
-            for i in range(num_drones):
-                uav_id = f"UAV-{i+1:02d}"
-                angle  = i * (2.0 * math.pi / num_drones)
-
-                alt_m    = 90.0 if (i % 2 == 0) else 105.0
-                altitude = -alt_m  # NED z (negative altitude)
-
-                start_x = radius * math.cos(angle)
-                start_y = radius * math.sin(angle)
-
-                # Hub entry gate — first SIPP corridor node target
-                entry_angle = angle + 0.35
-                wp1 = (110.0 * math.cos(entry_angle), 110.0 * math.sin(entry_angle), altitude)
-
-                # Retain legacy waypoint list for fallback / UI display
-                exit_angle = angle + math.pi - 0.25
-                wp2 = (110.0 * math.cos(exit_angle), 110.0 * math.sin(exit_angle), altitude)
-                wp3 = (-start_x, -start_y, altitude)
-                wp4 = (start_x, start_y, altitude)
-                self.uav_waypoint_routes[uav_id] = [wp1, wp2, wp3, wp4]
-
-                # Initial velocity toward hub entry gate
-                dx   = wp1[0] - start_x
-                dy   = wp1[1] - start_y
-                dist = math.hypot(dx, dy)
-                init_vx = (dx / dist) * 12.0 if dist > 0 else 0.0
-                init_vy = (dy / dist) * 12.0 if dist > 0 else 0.0
-
-                self.uavs[uav_id] = DynamicUAVState(
-                    id=uav_id,
-                    x=start_x, y=start_y, z=altitude,
-                    vx=init_vx, vy=init_vy, vz=0.0,
-                    color=colors[i % len(colors)],
-                    target_x=wp1[0], target_y=wp1[1], target_z=wp1[2],
-                    wp_index=0,
-                )
-
-        # --- Strategic Layer: SIPP mission planning (outside the lock for speed) ---
-        # Runs once at startup (or on reset), plans all 4D loop routes.
         drone_ids = [f"UAV-{i+1:02d}" for i in range(num_drones)]
         self.strategic.reset(num_drones=num_drones, sim_time=self.sim_time)
-        print("\n" + "=" * 70)
-        print("  STRATEGIC SIPP CORRIDOR PLANNER — 4D Mission Assignment")
-        print("=" * 70)
-        self.strategic.initialize_scenario(drone_ids, sim_time=self.sim_time)
-        print("=" * 70 + "\n")
+
+        if self.scenario_mode == "random":
+            print("\n" + "=" * 70)
+            print("  STRATEGIC SIPP CORRIDOR PLANNER — Random Station-to-Station Missions")
+            print("=" * 70)
+            od_pairs = self.strategic.initialize_random_scenario(
+                drone_ids, sim_time=self.sim_time, seed=seed
+            )
+            print("=" * 70 + "\n")
+
+            with self.lock:
+                self.uavs.clear()
+                self.uav_waypoint_routes.clear()
+
+                for i, uid in enumerate(drone_ids):
+                    orig, dest = od_pairs.get(uid, (f"PERIM_{i}", f"PERIM_{(i+5)%10}"))
+                    start_node = self.strategic.graph.nodes[orig]
+                    plan = self.strategic.plans.get(uid)
+
+                    if plan and plan.legs:
+                        leg0 = plan.legs[0]
+                        e0 = self.strategic.graph.edges[leg0.edge_id]
+                        tgt0 = self.strategic.graph.nodes[e0.to_id]
+                        tx, ty, tz = tgt0.x, tgt0.y, -leg0.alt_m
+                    else:
+                        tx, ty, tz = start_node.x, start_node.y, start_node.z
+
+                    dx = tx - start_node.x
+                    dy = ty - start_node.y
+                    dist = math.hypot(dx, dy)
+                    init_vx = 0.0
+                    init_vy = 0.0
+
+                    self.uavs[uid] = DynamicUAVState(
+                        id=uid,
+                        x=start_node.x, y=start_node.y, z=start_node.z,
+                        vx=init_vx, vy=init_vy, vz=0.0,
+                        color=colors[i % len(colors)],
+                        target_x=tx, target_y=ty, target_z=tz,
+                        wp_index=0,
+                    )
+        else:
+            with self.lock:
+                self.uavs.clear()
+                self.uav_waypoint_routes.clear()
+
+                for i in range(num_drones):
+                    uav_id = f"UAV-{i+1:02d}"
+                    angle  = i * (2.0 * math.pi / num_drones)
+
+                    alt_m    = 90.0 if (i % 2 == 0) else 105.0
+                    altitude = -alt_m  # NED z (negative altitude)
+
+                    start_x = radius * math.cos(angle)
+                    start_y = radius * math.sin(angle)
+
+                    # Hub entry gate — first SIPP corridor node target
+                    entry_angle = angle + 0.35
+                    wp1 = (110.0 * math.cos(entry_angle), 110.0 * math.sin(entry_angle), altitude)
+
+                    exit_angle = angle + math.pi - 0.25
+                    wp2 = (110.0 * math.cos(exit_angle), 110.0 * math.sin(exit_angle), altitude)
+                    wp3 = (-start_x, -start_y, altitude)
+                    wp4 = (start_x, start_y, altitude)
+                    self.uav_waypoint_routes[uav_id] = [wp1, wp2, wp3, wp4]
+
+                    # Initial velocity at rest (strategic layer commands acceleration after scheduled departure)
+                    init_vx = 0.0
+                    init_vy = 0.0
+
+                    self.uavs[uav_id] = DynamicUAVState(
+                        id=uav_id,
+                        x=start_x, y=start_y, z=altitude,
+                        vx=init_vx, vy=init_vy, vz=0.0,
+                        color=colors[i % len(colors)],
+                        target_x=wp1[0], target_y=wp1[1], target_z=wp1[2],
+                        wp_index=0,
+                    )
+
+            print("\n" + "=" * 70)
+            print("  STRATEGIC SIPP CORRIDOR PLANNER — 4D Mission Assignment")
+            print("=" * 70)
+            self.strategic.initialize_scenario(drone_ids, sim_time=self.sim_time)
+            print("=" * 70 + "\n")
 
 
 
@@ -260,19 +304,24 @@ class Simulation3DCore:
             #    Vertical velocity vz is locked to the corridor altitude controller,
             #    preventing RVO2 from pushing drones out of their flight levels.
             # ------------------------------------------------------------------
-            VERT_SEPARATION_BUBBLE = 12.0  # Flight level vertical clearance (m)
-            commands = {}
-
+            # Group agents by co-altitude layer (15m nominal spacing, >=12m vertical clearance)
+            layer_groups: Dict[int, List[str]] = {}
             for uid in uav_keys:
                 u = self.uavs[uid]
-                # Filter collision threats: only co-altitude drones
-                threats = [
-                    tid for tid in uav_keys
-                    if tid != uid and abs(self.uavs[tid].z - u.z) < VERT_SEPARATION_BUBBLE
-                ]
+                alt = abs(u.z)
+                layer_key = int(round(alt / 15.0)) * 15
+                layer_groups.setdefault(layer_key, []).append(uid)
+
+            commands = {}
+            for layer_key, group_uids in layer_groups.items():
+                if len(group_uids) <= 1:
+                    uid = group_uids[0]
+                    u = self.uavs[uid]
+                    commands[uid] = (float(u.vx_pref), float(u.vy_pref), float(u.vz_pref))
+                    continue
 
                 sim = rvo2.PyRVOSimulator(
-                    0.1,
+                    dt,
                     self.deconflict_engine.neighbor_dist,
                     self.deconflict_engine.max_neighbors,
                     self.deconflict_engine.time_horizon,
@@ -282,36 +331,28 @@ class Simulation3DCore:
                     (0.0, 0.0),
                 )
 
-                ego_aid = sim.addAgent(
-                    (float(u.x), float(u.y)),
-                    self.deconflict_engine.neighbor_dist,
-                    self.deconflict_engine.max_neighbors,
-                    self.deconflict_engine.time_horizon,
-                    self.deconflict_engine.time_horizon_obst,
-                    self.deconflict_engine.radius,
-                    self.deconflict_engine.max_speed,
-                    (float(u.vx), float(u.vy)),
-                )
-                sim.setAgentPrefVelocity(ego_aid, (float(u.vx_pref), float(u.vy_pref)))
-
-                for tid in threats:
-                    tu = self.uavs[tid]
+                agent_map = {}
+                for uid in group_uids:
+                    u = self.uavs[uid]
                     aid = sim.addAgent(
-                        (float(tu.x), float(tu.y)),
+                        (float(u.x), float(u.y)),
                         self.deconflict_engine.neighbor_dist,
                         self.deconflict_engine.max_neighbors,
                         self.deconflict_engine.time_horizon,
                         self.deconflict_engine.time_horizon_obst,
                         self.deconflict_engine.radius,
                         self.deconflict_engine.max_speed,
-                        (float(tu.vx), float(tu.vy)),
+                        (float(u.vx), float(u.vy)),
                     )
-                    sim.setAgentPrefVelocity(aid, (float(tu.vx_pref), float(tu.vy_pref)))
+                    sim.setAgentPrefVelocity(aid, (float(u.vx_pref), float(u.vy_pref)))
+                    agent_map[uid] = aid
 
                 sim.doStep()
-                v_cmd_2d = sim.getAgentVelocity(ego_aid)
-                # Vertical command tracks corridor altitude controller vz_pref
-                commands[uid] = (float(v_cmd_2d[0]), float(v_cmd_2d[1]), u.vz_pref)
+
+                for uid, aid in agent_map.items():
+                    u = self.uavs[uid]
+                    v_cmd_2d = sim.getAgentVelocity(aid)
+                    commands[uid] = (float(v_cmd_2d[0]), float(v_cmd_2d[1]), float(u.vz_pref))
 
             # ------------------------------------------------------------------
             # 5. Layer 3 (Physical): Integrate non-ideal multirotor dynamics.
@@ -366,6 +407,9 @@ class Simulation3DCore:
                     d["sipp_alt_m"]  = leg.alt_m
                     d["sipp_leg"]    = f"{li + 1}/{len(plan_info.legs)}"
                     d["mission_type"] = MissionType.name(plan_info.mission_type)
+                    d["origin"]      = getattr(plan_info, "origin_node", "")
+                    d["destination"] = getattr(plan_info, "destination_node", "")
+                    d["scenario_mode"] = getattr(self, "scenario_mode", "benchmark")
                 telemetry.append(d)
 
             return telemetry
@@ -407,6 +451,20 @@ def set_params():
 def reset():
     core.init_scenario()
     return jsonify({"success": True})
+
+
+@app.route("/api/scenario_mode", methods=["POST"])
+def set_scenario_mode():
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode", "benchmark")
+    core.init_scenario(mode=mode)
+    return jsonify({"success": True, "mode": core.scenario_mode})
+
+
+@app.route("/api/randomize", methods=["POST"])
+def randomize_missions():
+    core.init_scenario(mode="random")
+    return jsonify({"success": True, "mode": "random"})
 
 
 @app.route("/api/pause", methods=["POST"])
@@ -455,7 +513,9 @@ def telemetry_stream():
 @app.route("/api/corridor_graph")
 def corridor_graph():
     """Returns the static corridor graph (nodes + edges) as JSON for initial WebGL render."""
-    return jsonify(core.strategic.get_corridor_telemetry(sim_time=core.sim_time))
+    with core.lock:
+        data = core.strategic.get_corridor_telemetry(sim_time=core.sim_time)
+    return jsonify(data)
 
 
 def background_physics_loop():
@@ -481,9 +541,9 @@ def background_physics_loop():
             corridor_payload = None
             if corridor_broadcast_counter >= 15:
                 corridor_broadcast_counter = 0
-                corridor_payload = json.dumps(
-                    core.strategic.get_corridor_telemetry(sim_time=core.sim_time)
-                )
+                with core.lock:
+                    corridor_data = core.strategic.get_corridor_telemetry(sim_time=core.sim_time)
+                corridor_payload = json.dumps(corridor_data)
 
             for q in active_qs:
                 try:

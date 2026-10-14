@@ -73,7 +73,6 @@
       0% { transform: scale(1); opacity: 0.8; }
       100% { transform: scale(1.4); opacity: 1; }
     }
-    /* Controls Panel */
     .control-panel {
       position: absolute;
       top: 16px;
@@ -84,8 +83,17 @@
       border-radius: 8px;
       padding: 16px;
       width: 320px;
+      max-height: calc(100vh - 140px);
+      overflow-y: auto;
       backdrop-filter: blur(10px);
       box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    }
+    .control-panel::-webkit-scrollbar {
+      width: 5px;
+    }
+    .control-panel::-webkit-scrollbar-thumb {
+      background: rgba(0, 229, 255, 0.3);
+      border-radius: 3px;
     }
     .panel-section-title {
       font-size: 11px;
@@ -285,9 +293,36 @@
       <span class="val-display" id="disp-accel">5.0 m/s&sup2;</span>
     </div>
 
-    <div class="panel-section-title" style="margin-top: 14px;">3D Display Layers</div>
+    <div class="panel-section-title" style="margin-top: 14px;">Altitude Airspace Layers</div>
+    <div class="btn-group" id="layer-filter-buttons" style="margin-bottom: 8px;">
+      <button class="hud-btn active" id="btn-layer-all" onclick="setAltitudeFilter('all')">All Layers</button>
+      <button class="hud-btn" id="btn-layer-90" onclick="setAltitudeFilter('90')">FL090 (90m)</button>
+      <button class="hud-btn" id="btn-layer-105" onclick="setAltitudeFilter('105')">FL105 (105m)</button>
+    </div>
     <div class="control-row">
-      <label>4D SIPP Airspace Corridors</label>
+      <label>Altitude Layer Planes & Rings</label>
+      <input type="checkbox" id="layer-planes" checked onchange="toggleAltitudeFeatures()">
+    </div>
+    <div class="control-row">
+      <label>Vertical Altitude Scale / Mast</label>
+      <input type="checkbox" id="layer-mast" checked onchange="toggleAltitudeFeatures()">
+    </div>
+    <div class="control-row">
+      <label>Vertical Tolerance Bands (&plusmn;8m)</label>
+      <input type="checkbox" id="layer-bands" checked onchange="toggleAltitudeFeatures()">
+    </div>
+    <div class="control-row">
+      <label>Corridor Tubes (Cylinders)</label>
+      <input type="checkbox" id="layer-tubes" checked onchange="toggleAltitudeFeatures()">
+    </div>
+    <div class="control-row">
+      <label>Corridor Wireframe & Arrows</label>
+      <input type="checkbox" id="layer-arrows" checked onchange="toggleAltitudeFeatures()">
+    </div>
+
+    <div class="panel-section-title" style="margin-top: 14px;">UAV Dynamics Layers</div>
+    <div class="control-row">
+      <label>Airspace Corridors Master</label>
       <input type="checkbox" id="layer-corridors" checked onchange="toggleLayers()">
     </div>
     <div class="control-row">
@@ -303,6 +338,13 @@
       <input type="checkbox" id="layer-ribbons" checked onchange="toggleLayers()">
     </div>
 
+    <div class="panel-section-title" style="margin-top: 14px;">Scenario Routing Mode</div>
+    <div class="btn-group" id="scenario-mode-buttons" style="margin-bottom: 8px;">
+      <button class="hud-btn active" id="btn-mode-benchmark" onclick="setScenarioMode('benchmark')">Fixed Loop</button>
+      <button class="hud-btn" id="btn-mode-random" onclick="setScenarioMode('random')">Random Missions</button>
+    </div>
+    <button class="hud-btn" id="btn-randomize-now" style="width: 100%; margin-top: 4px;" onclick="randomizeDestinations()">🎲 Randomize Destinations Now</button>
+
     <div class="btn-group" style="margin-top: 12px;">
       <button class="hud-btn" onclick="resetScenario()">Reload Scenario</button>
       <button class="hud-btn" id="btn-pause" onclick="togglePause()">Pause Sim</button>
@@ -314,15 +356,20 @@
     <!-- Dynamically Populated by UAVs -->
   </div>
 
-  <!-- 3D Vector Legend -->
+  <!-- 3D Vector & Altitude Legend -->
   <div class="legend-box">
+    <div style="font-weight: 700; color: #38bdf8; font-size: 11px; margin-bottom: 6px; letter-spacing: 0.5px;">ALTITUDE AIRSPACE STRATA</div>
     <div class="legend-item">
-      <span class="legend-line" style="background: #00e5ff;"></span>
-      <span>SIPP Corridor Flight Level 90m (FL090)</span>
+      <span class="legend-line" style="background: #00e5ff; height: 6px;"></span>
+      <span><b>Layer 1: FL090 (90m AGL)</b> &bull; Cyan Plane (Even UAVs: 02, 04, 06, 08, 10)</span>
     </div>
     <div class="legend-item">
-      <span class="legend-line" style="background: #f97316;"></span>
-      <span>SIPP Corridor Flight Level 105m (FL105)</span>
+      <span class="legend-line" style="background: #f97316; height: 6px;"></span>
+      <span><b>Layer 2: FL105 (105m AGL)</b> &bull; Orange Plane (Odd UAVs: 01, 03, 05, 07, 09)</span>
+    </div>
+    <div class="legend-item" style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 4px; margin-top: 4px;">
+      <span class="legend-line" style="background: #eab308; height: 2px;"></span>
+      <span>Vertical Clearance: <b>&Delta;h = 15m Separation Standard</b> (&plusmn;8m bands)</span>
     </div>
     <div class="legend-item">
       <span class="legend-line" style="background: #00e5ff; border-top: 2px dashed #00e5ff; height: 0;"></span>
@@ -580,13 +627,262 @@
     }
 
     // =========================================================================
-    // --- Corridor Graph Visualization (Strategic Layer) ---
+    // --- Altitude Airspace Layers & Stratified Corridor System ---
     // =========================================================================
+
+    const altitudeLayersRoot = new THREE.Group();
+    scene.add(altitudeLayersRoot);
+
+    const layerGroups = {};       // alt (90, 105) → THREE.Group
+    let altitudeMastGroup = null; // Vertical elevation ruler tower
+    let selectedAltitudeFilter = 'all'; // 'all', '90', '105'
 
     // Storage for corridor tube meshes and node spheres
     const corridorEdgeMeshes = {};  // edge_id → THREE.Mesh (tube)
     const corridorNodeMeshes = {};  // node_id → THREE.Mesh (sphere)
     let corridorLayerVisible = true;
+
+    // Helper: Generate crisp 3D Canvas Billboard Labels (No external font file needed)
+    function createBillboardLabel(text, colorHex, bgColor) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 512;
+      canvas.height = 128;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, 512, 128);
+
+      // Background rounded pill
+      ctx.fillStyle = bgColor || 'rgba(10, 15, 26, 0.88)';
+      ctx.strokeStyle = colorHex || '#00e5ff';
+      ctx.lineWidth = 4;
+      if (ctx.roundRect) {
+        ctx.roundRect(8, 8, 496, 112, 18);
+      } else {
+        ctx.rect(8, 8, 496, 112);
+      }
+      ctx.fill();
+      ctx.stroke();
+
+      // Text label
+      ctx.font = 'bold 34px -apple-system, BlinkMacSystemFont, "Segoe UI", monospace';
+      ctx.fillStyle = colorHex || '#00e5ff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, 256, 64);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.minFilter = THREE.LinearFilter;
+      const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+      const sprite = new THREE.Sprite(mat);
+      sprite.scale.set(70, 17.5, 1);
+      return sprite;
+    }
+
+    // Initialize stratified horizontal altitude planes, range rings & vertical scale mast
+    function initAltitudeLayers() {
+      while (altitudeLayersRoot.children.length > 0) {
+        altitudeLayersRoot.remove(altitudeLayersRoot.children[0]);
+      }
+
+      // Layer 1: FL090 (90m, Cyan) & Layer 2: FL105 (105m, Orange)
+      const layersConfig = [
+        {
+          alt: 90.0,
+          name: 'FL090',
+          label: 'FL090 LAYER (90m AGL)',
+          badgeColor: '#00e5ff',
+          hex: 0x00e5ff,
+          badgePos: new THREE.Vector3(260, 90, 40),
+          desc: 'Layer 1: 90m (Even UAVs: 02, 04, 06, 08, 10)'
+        },
+        {
+          alt: 105.0,
+          name: 'FL105',
+          label: 'FL105 LAYER (105m AGL)',
+          badgeColor: '#f97316',
+          hex: 0xf97316,
+          badgePos: new THREE.Vector3(-260, 105, -40),
+          desc: 'Layer 2: 105m (Odd UAVs: 01, 03, 05, 07, 09)'
+        }
+      ];
+
+      layersConfig.forEach(cfg => {
+        const layerGroup = new THREE.Group();
+        layerGroup.userData = { alt: cfg.alt, name: cfg.name };
+
+        // 1. Semi-transparent Circular Airspace Disc
+        const discGeo = new THREE.CircleGeometry(310, 64);
+        const discMat = new THREE.MeshBasicMaterial({
+          color: cfg.hex,
+          transparent: true,
+          opacity: 0.075,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        });
+        const disc = new THREE.Mesh(discGeo, discMat);
+        disc.rotation.x = -Math.PI / 2;
+        disc.position.y = cfg.alt;
+        disc.userData = { isPlane: true };
+        layerGroup.add(disc);
+
+        // 2. Concentric Airspace Rings (Hub = 110m, Perimeter = 260m, Airspace Boundary = 310m)
+        const ringDefs = [
+          { rInner: 38,    rOuter: 40,  opacity: 0.25 }, // Center core
+          { rInner: 108.5, rOuter: 110, opacity: 0.55 }, // Hub Entry/Exit Gates Ring
+          { rInner: 258.5, rOuter: 260, opacity: 0.70 }, // Perimeter Stations Ring
+          { rInner: 308.5, rOuter: 310, opacity: 0.40 }, // Outer Airspace Ceiling Ring
+        ];
+        ringDefs.forEach(r => {
+          const ringGeo = new THREE.RingGeometry(r.rInner, r.rOuter, 64);
+          const ringMat = new THREE.MeshBasicMaterial({
+            color: cfg.hex,
+            transparent: true,
+            opacity: r.opacity,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          });
+          const ringMesh = new THREE.Mesh(ringGeo, ringMat);
+          ringMesh.rotation.x = -Math.PI / 2;
+          ringMesh.position.y = cfg.alt;
+          ringMesh.userData = { isPlane: true };
+          layerGroup.add(ringMesh);
+        });
+
+        // 3. Radial Spoke Lines (Polar grid rays)
+        const spokesGeo = new THREE.BufferGeometry();
+        const spokePoints = [];
+        for (let a = 0; a < 8; a++) {
+          const ang = a * (Math.PI / 4);
+          spokePoints.push(new THREE.Vector3(0, cfg.alt, 0));
+          spokePoints.push(new THREE.Vector3(310 * Math.cos(ang), cfg.alt, 310 * Math.sin(ang)));
+        }
+        spokesGeo.setFromPoints(spokePoints);
+        const spokesMat = new THREE.LineBasicMaterial({
+          color: cfg.hex,
+          transparent: true,
+          opacity: 0.18,
+          depthWrite: false,
+        });
+        const spokesLine = new THREE.LineSegments(spokesGeo, spokesMat);
+        spokesLine.userData = { isPlane: true };
+        layerGroup.add(spokesLine);
+
+        // 4. Vertical Tolerance Band Volume (±8m corridor slab)
+        const bandHeight = 16.0; // 90±8m or 105±8m
+        const bandGeo = new THREE.CylinderGeometry(310, 310, bandHeight, 48, 1, true);
+        const bandMat = new THREE.MeshBasicMaterial({
+          color: cfg.hex,
+          transparent: true,
+          opacity: 0.035,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        });
+        const bandMesh = new THREE.Mesh(bandGeo, bandMat);
+        bandMesh.position.y = cfg.alt;
+        bandMesh.userData = { isBand: true };
+        layerGroup.add(bandMesh);
+
+        // 5. Floating 3D Airspace Badge
+        const badge = createBillboardLabel(cfg.label, cfg.badgeColor);
+        badge.position.copy(cfg.badgePos);
+        badge.userData = { isPlane: true };
+        layerGroup.add(badge);
+
+        layerGroups[cfg.alt] = layerGroup;
+        altitudeLayersRoot.add(layerGroup);
+      });
+
+      // 6. Build Vertical Altitude Scale / Elevation Mast
+      buildAltitudeMast();
+    }
+
+    function buildAltitudeMast() {
+      altitudeMastGroup = new THREE.Group();
+      const mastX = 340;
+      const mastZ = -100;
+
+      // Vertical Column from y=0 to y=140
+      const colHeight = 140;
+      const colGeo = new THREE.CylinderGeometry(1.4, 1.4, colHeight, 12);
+      const colMat = new THREE.MeshStandardMaterial({
+        color: 0x334155,
+        metalness: 0.8,
+        roughness: 0.3
+      });
+      const col = new THREE.Mesh(colGeo, colMat);
+      col.position.set(mastX, colHeight / 2, mastZ);
+      altitudeMastGroup.add(col);
+
+      // Base Pedestal
+      const baseGeo = new THREE.CylinderGeometry(12, 14, 3, 16);
+      const baseMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.6 });
+      const baseMesh = new THREE.Mesh(baseGeo, baseMat);
+      baseMesh.position.set(mastX, 1.5, mastZ);
+      altitudeMastGroup.add(baseMesh);
+
+      // Elevation Shelves & Ticks
+      const ticks = [
+        { y: 0,   text: 'GND (0m)', color: '#94a3b8' },
+        { y: 45,  text: '45m AGL',  color: '#64748b' },
+        { y: 90,  text: 'FL090 (90m)', color: '#00e5ff', linkLayer: 90 },
+        { y: 105, text: 'FL105 (105m)', color: '#f97316', linkLayer: 105 },
+        { y: 135, text: '135m CLR', color: '#64748b' },
+      ];
+
+      ticks.forEach(t => {
+        // Horizontal tick arm
+        const armGeo = new THREE.CylinderGeometry(0.6, 0.6, 16, 8);
+        const armMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(t.color) });
+        const arm = new THREE.Mesh(armGeo, armMat);
+        arm.rotation.z = Math.PI / 2;
+        arm.position.set(mastX - 8, t.y, mastZ);
+        altitudeMastGroup.add(arm);
+
+        // Tick Label Sprite
+        const tickSprite = createBillboardLabel(t.text, t.color);
+        tickSprite.scale.set(45, 11, 1);
+        tickSprite.position.set(mastX + 28, t.y, mastZ);
+        altitudeMastGroup.add(tickSprite);
+
+        // Horizontal laser dashed guide line projecting into the altitude disc
+        if (t.linkLayer) {
+          const discRimX = 310 * Math.cos(Math.atan2(mastZ, mastX));
+          const discRimZ = 310 * Math.sin(Math.atan2(mastZ, mastX));
+
+          const lineGeo = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(mastX - 16, t.y, mastZ),
+            new THREE.Vector3(discRimX, t.y, discRimZ)
+          ]);
+          const lineMat = new THREE.LineDashedMaterial({
+            color: new THREE.Color(t.color),
+            dashSize: 6,
+            gapSize: 4,
+            transparent: true,
+            opacity: 0.65
+          });
+          const guideLine = new THREE.Line(lineGeo, lineMat);
+          guideLine.computeLineDistances();
+          altitudeMastGroup.add(guideLine);
+        }
+      });
+
+      // Vertical Separation Bracket between 90m and 105m (Δh = 15m)
+      const bracketGeo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(mastX - 18, 90, mastZ),
+        new THREE.Vector3(mastX - 22, 90, mastZ),
+        new THREE.Vector3(mastX - 22, 105, mastZ),
+        new THREE.Vector3(mastX - 18, 105, mastZ),
+      ]);
+      const bracketMat = new THREE.LineBasicMaterial({ color: 0xeab308, linewidth: 2 });
+      const bracketLine = new THREE.Line(bracketGeo, bracketMat);
+      altitudeMastGroup.add(bracketLine);
+
+      const sepSprite = createBillboardLabel('Δh = 15m Sep', '#eab308', 'rgba(15, 23, 42, 0.92)');
+      sepSprite.scale.set(40, 10, 1);
+      sepSprite.position.set(mastX - 38, 97.5, mastZ);
+      altitudeMastGroup.add(sepSprite);
+
+      altitudeLayersRoot.add(altitudeMastGroup);
+    }
 
     // Altitude → colour mapping (matches strategic_planner.py levels)
     function altitudeToColor(alt_m) {
@@ -599,6 +895,105 @@
     // NED: x=North, y=East, z=Down  →  THREE: X=East, Y=Altitude(up), Z=-North
     function nedToThree(x, y, z) {
       return new THREE.Vector3(y, -z, -x);
+    }
+
+    function setAltitudeFilter(filter) {
+      selectedAltitudeFilter = filter;
+      document.querySelectorAll('#layer-filter-buttons .hud-btn').forEach(b => b.classList.remove('active'));
+      const activeBtn = document.getElementById(`btn-layer-${filter}`);
+      if (activeBtn) activeBtn.classList.add('active');
+
+      applyAltitudeFilter();
+    }
+
+    function toggleAltitudeFeatures() {
+      applyAltitudeFilter();
+    }
+
+    function applyAltitudeFilter() {
+      const showPlanes = document.getElementById('layer-planes') ? document.getElementById('layer-planes').checked : true;
+      const showMast = document.getElementById('layer-mast') ? document.getElementById('layer-mast').checked : true;
+      const showBands = document.getElementById('layer-bands') ? document.getElementById('layer-bands').checked : true;
+      const showTubes = document.getElementById('layer-tubes') ? document.getElementById('layer-tubes').checked : true;
+      const showArrows = document.getElementById('layer-arrows') ? document.getElementById('layer-arrows').checked : true;
+      const showCorridorsMaster = document.getElementById('layer-corridors') ? document.getElementById('layer-corridors').checked : true;
+
+      // 1. Layer Planes & Bands
+      Object.entries(layerGroups).forEach(([altStr, group]) => {
+        const alt = parseFloat(altStr);
+        const matchesFilter = (selectedAltitudeFilter === 'all') ||
+          (selectedAltitudeFilter === '90' && alt <= 95) ||
+          (selectedAltitudeFilter === '105' && alt > 95);
+
+        group.visible = matchesFilter;
+
+        group.children.forEach(child => {
+          if (child.userData.isPlane) {
+            child.visible = showPlanes;
+          } else if (child.userData.isBand) {
+            child.visible = showBands;
+          }
+        });
+      });
+
+      // 2. Altitude Mast Tower
+      if (altitudeMastGroup) {
+        altitudeMastGroup.visible = showMast;
+      }
+
+      // 3. Corridor Tubes & Edges
+      Object.entries(corridorEdgeMeshes).forEach(([key, mesh]) => {
+        if (!mesh) return;
+        const alt = mesh.userData.alt_m || 90;
+        const isTube = !key.includes('_wire') && !key.includes('_arrow');
+        const isWire = key.includes('_wire');
+        const isArrow = key.includes('_arrow');
+
+        const matchesFilter = (selectedAltitudeFilter === 'all') ||
+          (selectedAltitudeFilter === '90' && alt <= 95) ||
+          (selectedAltitudeFilter === '105' && alt > 95);
+
+        if (!showCorridorsMaster || !matchesFilter) {
+          mesh.visible = false;
+        } else {
+          if (isTube) {
+            mesh.visible = showTubes;
+          } else if (isWire || isArrow) {
+            mesh.visible = showArrows;
+          }
+        }
+      });
+
+      // 4. Corridor Nodes
+      Object.entries(corridorNodeMeshes).forEach(([id, mesh]) => {
+        if (!mesh) return;
+        const alt = mesh.userData.alt_m || 90;
+        const matchesFilter = (selectedAltitudeFilter === 'all') ||
+          (selectedAltitudeFilter === '90' && alt <= 95) ||
+          (selectedAltitudeFilter === '105' && alt > 95);
+
+        mesh.visible = showCorridorsMaster && matchesFilter;
+      });
+
+      // 5. Update UAV Visibility based on filter
+      Object.values(uavs).forEach(u => {
+        const uavAlt = u.currentAltitude || 90;
+        const matchesFilter = (selectedAltitudeFilter === 'all') ||
+          (selectedAltitudeFilter === '90' && uavAlt <= 97.5) ||
+          (selectedAltitudeFilter === '105' && uavAlt > 97.5);
+
+        if (matchesFilter) {
+          u.mesh.visible = true;
+          if (u.trailLine) u.trailLine.visible = document.getElementById('layer-ribbons').checked;
+          if (u.leadLine) u.leadLine.visible = true;
+          if (u.wpGroup) u.wpGroup.visible = true;
+        } else {
+          u.mesh.visible = false;
+          if (u.trailLine) u.trailLine.visible = false;
+          if (u.leadLine) u.leadLine.visible = false;
+          if (u.wpGroup) u.wpGroup.visible = false;
+        }
+      });
     }
 
     function renderCorridorGraph(data) {
@@ -634,6 +1029,7 @@
           const quaternion = new THREE.Quaternion().setFromUnitVectors(axis, normDir);
           tube.setRotationFromQuaternion(quaternion);
           tube.position.copy(mid);
+          tube.userData = { alt_m: edge.alt_m, edgeId: edge.id };
           scene.add(tube);
           corridorEdgeMeshes[edge.id] = tube;
 
@@ -647,29 +1043,29 @@
           const wireTube = new THREE.Mesh(geo.clone(), wireMat);
           wireTube.setRotationFromQuaternion(quaternion);
           wireTube.position.copy(mid);
+          wireTube.userData = { alt_m: edge.alt_m, edgeId: edge.id };
           scene.add(wireTube);
           corridorEdgeMeshes[edge.id + '_wire'] = wireTube;
 
           // Directional arrow at midpoint
           const normDir2 = normDir.clone();
           const arrowHelper = new THREE.ArrowHelper(normDir2, mid, 20, color.getHex(), 8, 4);
+          arrowHelper.userData = { alt_m: edge.alt_m, edgeId: edge.id };
           scene.add(arrowHelper);
           corridorEdgeMeshes[edge.id + '_arrow'] = arrowHelper;
         } else {
           // Update color if altitude changed
           corridorEdgeMeshes[edge.id].material.color.copy(color);
-          if (corridorEdgeMeshes[edge.id + '_wire'])
+          corridorEdgeMeshes[edge.id].userData.alt_m = edge.alt_m;
+          if (corridorEdgeMeshes[edge.id + '_wire']) {
             corridorEdgeMeshes[edge.id + '_wire'].material.color.copy(color);
-          if (corridorEdgeMeshes[edge.id + '_arrow'])
+            corridorEdgeMeshes[edge.id + '_wire'].userData.alt_m = edge.alt_m;
+          }
+          if (corridorEdgeMeshes[edge.id + '_arrow']) {
             corridorEdgeMeshes[edge.id + '_arrow'].setColor(color.getHex());
+            corridorEdgeMeshes[edge.id + '_arrow'].userData.alt_m = edge.alt_m;
+          }
         }
-
-        // Visibility
-        const show = corridorLayerVisible;
-        ['', '_wire', '_arrow'].forEach(suffix => {
-          const m = corridorEdgeMeshes[edge.id + suffix];
-          if (m) m.visible = show;
-        });
       });
 
       // --- Draw/update node spheres ---
@@ -685,13 +1081,17 @@
           });
           const sphere = new THREE.Mesh(geo, mat);
           sphere.position.copy(pos);
+          sphere.userData = { alt_m: -node.z, nodeId: node.id };
           scene.add(sphere);
           corridorNodeMeshes[node.id] = sphere;
         } else {
           corridorNodeMeshes[node.id].position.copy(pos);
+          corridorNodeMeshes[node.id].userData.alt_m = -node.z;
         }
-        corridorNodeMeshes[node.id].visible = corridorLayerVisible;
       });
+
+      // Apply current layer filter visibility immediately
+      applyAltitudeFilter();
     }
 
     // Apply SIPP drone_plans overlay onto UAV telemetry cards (called from handleTelemetryTick)
@@ -699,6 +1099,11 @@
     function handleCorridorTelemetry(data) {
       renderCorridorGraph(data);
       lastSippPlans = data.drone_plans || {};
+      if (data.scenario_mode) {
+        document.querySelectorAll('#scenario-mode-buttons .hud-btn').forEach(b => b.classList.remove('active'));
+        const btn = document.getElementById(`btn-mode-${data.scenario_mode}`);
+        if (btn) btn.classList.add('active');
+      }
     }
 
     // --- State Storage ---
@@ -797,6 +1202,19 @@
         const px = item.y;               // East
         const py = -item.z;              // Altitude (positive up)
         const pz = -item.x;              // -North (camera looks along -Z)
+
+        u.currentAltitude = py;
+        const matchesFilter = (selectedAltitudeFilter === 'all') ||
+          (selectedAltitudeFilter === '90' && py <= 97.5) ||
+          (selectedAltitudeFilter === '105' && py > 97.5);
+
+        u.mesh.visible = matchesFilter;
+        if (!matchesFilter) {
+          if (u.trailLine) u.trailLine.visible = false;
+          if (u.leadLine) u.leadLine.visible = false;
+          if (u.wpGroup) u.wpGroup.visible = false;
+          return;
+        }
 
         u.mesh.position.set(px, py, pz);
 
@@ -933,13 +1351,22 @@
         const sippSpeed = (u.sipp_speed !== undefined ? u.sipp_speed.toFixed(1) : speed);
         const missionType = u.mission_type || 'PATROL';
 
+        const isFL090 = parseFloat(alt) <= 97.5;
+        const layerBadgeHtml = `<span style="font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 3px; background: ${isFL090 ? 'rgba(0, 229, 255, 0.2)' : 'rgba(249, 115, 22, 0.2)'}; color: ${isFL090 ? '#00e5ff' : '#f97316'}; border: 1px solid ${isFL090 ? '#00e5ff' : '#f97316'}; margin-left: 6px;">${isFL090 ? 'FL090 (90m)' : 'FL105 (105m)'}</span>`;
+
+        const plan = lastSippPlans[u.id] || {};
+        const origin = u.origin || plan.origin || '';
+        const dest = u.destination || plan.destination || '';
+        const missionRoute = (origin && dest && origin !== dest) ? `${origin} &rarr; ${dest}` : `${sippEdge} (${sippLeg})`;
+
         card.innerHTML = `
           <div class="uav-card-header">
-            <span class="uav-id">${u.id === 'Ego' ? 'EGO (PX4 SITL)' : u.id} <span style="font-size: 10px; color: #a855f7;">[${missionType}]</span></span>
+            <span class="uav-id">${u.id === 'Ego' ? 'EGO (PX4 SITL)' : u.id} ${layerBadgeHtml} <span style="font-size: 10px; color: #a855f7;">[${missionType}]</span></span>
             <span class="uav-mode">${u.in_conflict ? 'CONFLICT' : 'CLEAR'}</span>
           </div>
           <div class="telemetry-grid">
             <div class="tel-item"><span>Corridor:</span><span class="tel-val" style="color: #00e5ff;">${sippEdge} (${sippLeg})</span></div>
+            <div class="tel-item"><span>Mission:</span><span class="tel-val" style="color: #ffd700; font-size: 10px;">${missionRoute}</span></div>
             <div class="tel-item"><span>Alt (Z):</span><span class="tel-val">${alt} m</span></div>
             <div class="tel-item"><span>SIPP Spd:</span><span class="tel-val" style="color: #38bdf8;">${sippSpeed} m/s</span></div>
             <div class="tel-item"><span>Phys Spd:</span><span class="tel-val">${speed} m/s</span></div>
@@ -960,8 +1387,8 @@
       if (mode === 'orbit') {
         event.target.classList.add('active');
         controls.enabled = true;
-        controls.target.set(0, 100, 0);
-        camera.position.set(0, 280, 420);
+        controls.target.set(0, 97.5, 0);
+        camera.position.set(0, 260, 420);
       } else if (mode === 'chase') {
         event.target.classList.add('active');
         controls.enabled = false;
@@ -973,8 +1400,8 @@
       } else if (mode === 'side') {
         event.target.classList.add('active');
         controls.enabled = true;
-        controls.target.set(0, 100, 0);
-        camera.position.set(550, 100, 0);
+        controls.target.set(0, 97.5, 0);
+        camera.position.set(520, 97.5, 0);
       }
     }
 
@@ -987,8 +1414,7 @@
 
       const showCorridors = document.getElementById('layer-corridors') ? document.getElementById('layer-corridors').checked : true;
       corridorLayerVisible = showCorridors;
-      Object.values(corridorEdgeMeshes).forEach(m => { if (m) m.visible = showCorridors; });
-      Object.values(corridorNodeMeshes).forEach(m => { if (m) m.visible = showCorridors; });
+      applyAltitudeFilter();
     }
 
     function updatePhysicsParams() {
@@ -1009,6 +1435,26 @@
 
     function resetScenario() {
       fetch('/api/reset', { method: 'POST' });
+    }
+
+    let currentScenarioMode = 'benchmark';
+
+    function setScenarioMode(mode) {
+      currentScenarioMode = mode;
+      document.querySelectorAll('#scenario-mode-buttons .hud-btn').forEach(b => b.classList.remove('active'));
+      const btn = document.getElementById(`btn-mode-${mode}`);
+      if (btn) btn.classList.add('active');
+
+      fetch('/api/scenario_mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: mode }),
+      });
+    }
+
+    function randomizeDestinations() {
+      setScenarioMode('random');
+      fetch('/api/randomize', { method: 'POST' });
     }
 
     function togglePause() {
@@ -1035,6 +1481,7 @@
     });
 
     // Start
+    initAltitudeLayers();
     fetch('/api/corridor_graph')
       .then(res => res.json())
       .then(data => handleCorridorTelemetry(data))
