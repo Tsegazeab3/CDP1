@@ -107,6 +107,7 @@ class Simulation3DCore:
         # UAV State Store & Trajectories
         self.uavs: Dict[str, DynamicUAVState] = {}
         self.uav_classes: Dict[str, str] = {}
+        self.uav_waypoint_routes: Dict[str, List[Tuple[float, float, float]]] = {}
         self.uav_waypoints_4d: Dict[str, List[Tuple[float, float, float, float, float, float]]] = {}
 
         # Sim control & metrics
@@ -150,16 +151,13 @@ class Simulation3DCore:
     def init_scenario(
         self,
         num_drones: int = 10,
-        radius: float = 240.0,
+        radius: float = 260.0,
         mode: Optional[str] = None,
         seed: Optional[int] = 42,
     ):
-        """Initializes multi-UAV scenario with assigned strategic trajectories."""
+        """Initializes multi-UAV scenario with assigned strategic trajectories along corridors."""
         if mode is not None:
             self.scenario_mode = mode
-
-        scale = self.current_sensor_profile.nominal_arena_scale
-        scaled_radius = radius * scale
 
         drone_ids = [f"UAV-{i+1:02d}" for i in range(num_drones)]
         class_keys = ["SCOUT", "COURIER", "HEAVY_LIFT"]
@@ -167,36 +165,54 @@ class Simulation3DCore:
             uid: class_keys[i % len(class_keys)] for i, uid in enumerate(drone_ids)
         }
 
-        # Calculate starts and goals for all drones
-        starts_list = []
-        goals_list = []
+        # Build corridor waypoints for each drone matching CorridorGraph:
+        # W0: PERIM_i (station pad at 260m)
+        # W1: HUB_IN_i (hub entry gate at 110m, angle + 0.35)
+        # W2: HUB_OUT_i (hub exit gate at 110m, angle + pi - 0.25)
+        # W3: PERIM_{(i+5)%10} (opposite destination station at 260m)
+        # W4: PERIM_i (return station at 260m)
+        hub_r = 110.0
+        routes = {}
+        hub_ins = []
+        hub_outs = []
 
-        for i in range(num_drones):
+        for i, uid in enumerate(drone_ids):
             angle = i * (2.0 * math.pi / num_drones)
-            alt_m = (90.0 if (i % 2 == 0) else 105.0) * scale
+            alt_m = 90.0 if (i % 2 == 0) else 105.0
+            altitude = -alt_m
 
-            start_x = scaled_radius * math.cos(angle)
-            start_y = scaled_radius * math.sin(angle)
-            goal_x = -start_x
-            goal_y = -start_y
+            start_x = radius * math.cos(angle)
+            start_y = radius * math.sin(angle)
 
-            starts_list.append([start_x, start_y, alt_m, 0.0, 0.0, 0.0])
-            goals_list.append([goal_x, goal_y, alt_m, 0.0, 0.0, 0.0])
+            in_angle = angle + 0.35
+            out_angle = angle + math.pi - 0.25
 
-        starts_arr = np.array(starts_list)
-        goals_arr = np.array(goals_list)
+            wp1 = (hub_r * math.cos(in_angle), hub_r * math.sin(in_angle), altitude)
+            wp2 = (hub_r * math.cos(out_angle), hub_r * math.sin(out_angle), altitude)
+            wp3 = (-start_x, -start_y, altitude)
+            wp4 = (start_x, start_y, altitude)
+            routes[uid] = [wp1, wp2, wp3, wp4]
 
-        # Run chosen Strategic Planner
+            hub_ins.append([wp1[0], wp1[1], alt_m, 0.0, 0.0, 0.0])
+            hub_outs.append([wp2[0], wp2[1], alt_m, 0.0, 0.0, 0.0])
+
+        hub_ins_arr = np.array(hub_ins)
+        hub_outs_arr = np.array(hub_outs)
+
+        # Strategic planning for Corridor and Hub Crossing
         if self.strategic_method == "sipp":
             self.strategic_sipp.reset(num_drones=num_drones, sim_time=0.0)
-            self.strategic_sipp.initialize_scenario(drone_ids, sim_time=0.0)
+            if self.scenario_mode == "random":
+                self.strategic_sipp.initialize_random_scenario(drone_ids, sim_time=0.0, seed=seed)
+            else:
+                self.strategic_sipp.initialize_scenario(drone_ids, sim_time=0.0)
             self.strategic_plan_result = None
         else:
             opt_method = self.strategic_method if self.strategic_method in ["d4orm", "d4orm-d", "mppi", "cem", "straight"] else "d4orm"
             agent_classes = [self.uav_classes[uid] for uid in drone_ids]
             self.strategic_plan_result = self.strategic_optimizer.plan(
-                starts=starts_arr,
-                goals=goals_arr,
+                starts=hub_ins_arr,
+                goals=hub_outs_arr,
                 method=opt_method,
                 agent_classes=agent_classes,
                 seed=seed if seed is not None else 42,
@@ -205,32 +221,62 @@ class Simulation3DCore:
         with self.lock:
             self.sim_time = 0.0
             self.uavs.clear()
+            self.uav_waypoint_routes = routes
             self.uav_waypoints_4d.clear()
 
-            for i, uid in enumerate(drone_ids):
-                d_class = DRONE_CLASSES[self.uav_classes[uid]]
-                sx, sy, alt_m = starts_arr[i, :3]
-                altitude = -alt_m  # NED negative
-
-                if self.strategic_plan_result is not None:
+            if self.strategic_plan_result is not None:
+                for i, uid in enumerate(drone_ids):
                     wpts = self.strategic_plan_result.get_agent_waypoints(i)
                     self.uav_waypoints_4d[uid] = [
                         (w.t, w.x, w.y, -w.z, w.vx, w.vy) for w in wpts
                     ]
-                    tx, ty, tz = wpts[min(1, len(wpts)-1)].x, wpts[min(1, len(wpts)-1)].y, -wpts[min(1, len(wpts)-1)].z
-                else:
-                    tx, ty, tz = goals_arr[i, 0], goals_arr[i, 1], -goals_arr[i, 2]
 
-                gx, gy, gz = goals_arr[i, 0], goals_arr[i, 1], -goals_arr[i, 2]
-                self.uavs[uid] = DynamicUAVState(
-                    id=uid,
-                    x=sx, y=sy, z=altitude,
-                    vx=0.0, vy=0.0, vz=0.0,
-                    color=d_class.color_hex,
-                    target_x=tx, target_y=ty, target_z=tz,
-                    dest_x=gx, dest_y=gy, dest_z=gz,
-                    wp_index=0,
-                )
+            if self.scenario_mode == "random" and self.strategic_method == "sipp":
+                for uid in drone_ids:
+                    plan = self.strategic_sipp.plans.get(uid)
+                    d_class = DRONE_CLASSES[self.uav_classes[uid]]
+                    if plan and plan.legs:
+                        start_edge = self.strategic_sipp.graph.edges.get(plan.legs[0].edge_id)
+                        start_node = self.strategic_sipp.graph.nodes[start_edge.from_id]
+                        dest_node = self.strategic_sipp.graph.nodes[plan.destination_node]
+                        sx, sy, sz = start_node.x, start_node.y, start_node.z
+                        gx, gy, gz = dest_node.x, dest_node.y, dest_node.z
+                        tgt_node = self.strategic_sipp.graph.nodes[start_edge.to_id]
+                        tx, ty, tz = tgt_node.x, tgt_node.y, tgt_node.z
+                    else:
+                        sx, sy, sz = 0.0, 0.0, -90.0
+                        gx, gy, gz = 0.0, 0.0, -90.0
+                        tx, ty, tz = 0.0, 0.0, -90.0
+                    self.uavs[uid] = DynamicUAVState(
+                        id=uid,
+                        x=sx, y=sy, z=sz,
+                        vx=0.0, vy=0.0, vz=0.0,
+                        color=d_class.color_hex,
+                        target_x=tx, target_y=ty, target_z=tz,
+                        dest_x=gx, dest_y=gy, dest_z=gz,
+                        wp_index=0,
+                    )
+            else:
+                for i, uid in enumerate(drone_ids):
+                    d_class = DRONE_CLASSES[self.uav_classes[uid]]
+                    angle = i * (2.0 * math.pi / num_drones)
+                    alt_m = 90.0 if (i % 2 == 0) else 105.0
+                    altitude = -alt_m
+                    sx = radius * math.cos(angle)
+                    sy = radius * math.sin(angle)
+                    r = self.uav_waypoint_routes[uid]
+                    tx, ty, tz = r[0]
+                    gx, gy, gz = r[2]
+
+                    self.uavs[uid] = DynamicUAVState(
+                        id=uid,
+                        x=sx, y=sy, z=altitude,
+                        vx=0.0, vy=0.0, vz=0.0,
+                        color=d_class.color_hex,
+                        target_x=tx, target_y=ty, target_z=tz,
+                        dest_x=gx, dest_y=gy, dest_z=gz,
+                        wp_index=0,
+                    )
 
     def step(self, dt: float) -> List[dict]:
         """Executes one simulation step across strategic tracking, tactical RVO2, and physics."""
@@ -245,33 +291,54 @@ class Simulation3DCore:
             strategic_targets: Dict[str, Tuple[float, float, float, float]] = {}
 
             # ------------------------------------------------------------------
-            # 1. Strategic Layer Target Tracking
+            # 1. Strategic Layer Target Tracking (Corridors + Hub Crossing)
             # ------------------------------------------------------------------
             for uid in uav_keys:
                 u = self.uavs[uid]
                 d_class = DRONE_CLASSES.get(self.uav_classes.get(uid, "COURIER"), DRONE_CLASSES["COURIER"])
 
-                if self.strategic_plan_result is not None and uid in self.uav_waypoints_4d:
-                    # Sample along 4D pre-computed trajectory
-                    wpts = self.uav_waypoints_4d[uid]
-                    # Find lookahead waypoint ~1.0 second ahead
-                    lookahead_t = self.sim_time + 0.8
-                    chosen_wpt = wpts[-1]
-                    for w in wpts:
-                        if w[0] >= lookahead_t:
-                            chosen_wpt = w
-                            break
-
-                    tx, ty, tz = chosen_wpt[1], chosen_wpt[2], chosen_wpt[3]
-                    tspeed = min(d_class.max_speed_ms, math.hypot(chosen_wpt[4], chosen_wpt[5]) + 2.0)
-                    strategic_targets[uid] = (tx, ty, tz, max(3.0, tspeed))
-                else:
-                    # SIPP Corridor target
+                if self.strategic_method == "sipp":
                     spd = math.hypot(u.vx, u.vy)
                     tx, ty, tz, tspeed = self.strategic_sipp.get_current_target(
                         uid, (u.x, u.y, u.z), spd, self.sim_time
                     )
-                    strategic_targets[uid] = (tx, ty, tz, min(d_class.max_speed_ms, tspeed))
+                    strategic_targets[uid] = (tx, ty, tz, min(d_class.max_speed_ms, max(3.0, tspeed)))
+                    plan = self.strategic_sipp.plans.get(uid)
+                    if plan and plan.destination_node in self.strategic_sipp.graph.nodes:
+                        dn = self.strategic_sipp.graph.nodes[plan.destination_node]
+                        u.dest_x, u.dest_y, u.dest_z = dn.x, dn.y, dn.z
+                else:
+                    routes = self.uav_waypoint_routes.get(uid, [])
+                    if not routes:
+                        strategic_targets[uid] = (u.x, u.y, u.z, 0.0)
+                        continue
+
+                    wp_idx = u.wp_index % len(routes)
+                    curr_wp = routes[wp_idx]
+                    dist_to_wp = math.hypot(curr_wp[0] - u.x, curr_wp[1] - u.y, curr_wp[2] - u.z)
+
+                    if dist_to_wp < 14.0:
+                        u.wp_index = (u.wp_index + 1) % len(routes)
+                        wp_idx = u.wp_index % len(routes)
+                        curr_wp = routes[wp_idx]
+
+                    if wp_idx == 1 and uid in self.uav_waypoints_4d:
+                        # Central hub crossing: track D4ORM/MPPI/CEM optimized 4D path
+                        hub_wpts = self.uav_waypoints_4d[uid]
+                        in_pt = routes[0]
+                        out_pt = routes[1]
+                        tot_hub_dist = math.hypot(out_pt[0] - in_pt[0], out_pt[1] - in_pt[1])
+                        done_dist = math.hypot(u.x - in_pt[0], u.y - in_pt[1])
+                        frac = max(0.0, min(1.0, done_dist / max(1.0, tot_hub_dist)))
+                        wpt_idx = min(len(hub_wpts) - 1, int(frac * len(hub_wpts)) + 2)
+                        hw = hub_wpts[wpt_idx]
+                        tx, ty, tz = hw[1], hw[2], hw[3]
+                        strategic_targets[uid] = (tx, ty, tz, d_class.max_speed_ms)
+                    else:
+                        tx, ty, tz = curr_wp
+                        strategic_targets[uid] = (tx, ty, tz, d_class.max_speed_ms)
+
+                    u.dest_x, u.dest_y, u.dest_z = routes[2]
 
                 u.target_x, u.target_y, u.target_z = strategic_targets[uid][:3]
 
@@ -430,31 +497,51 @@ def set_sensor_profile():
 
 @app.route("/api/strategic_trajectories", methods=["GET"])
 def get_strategic_trajectories():
-    """Returns 3D waypoints of the strategic trajectory plan for WebGL visualization."""
+    """Returns 3D waypoints of the strategic trajectory plan along corridors for WebGL visualization."""
     with core.lock:
-        if core.strategic_plan_result is None:
-            return jsonify({"available": False, "trajectories": []})
-
         trajs = []
-        for i in range(core.strategic_plan_result.num_agents):
-            uid = f"UAV-{i+1:02d}"
-            wpts = core.strategic_plan_result.get_agent_waypoints(i)
-            pts = [
-                {
-                    "three_x": float(w.y),
-                    "three_y": float(abs(w.z)),
-                    "three_z": float(-w.x)
-                }
-                for w in wpts
-            ]
-            u = core.uavs.get(uid)
-            if u is not None and u.dest_x is not None:
-                goal_three = {
-                    "three_x": float(u.dest_y),
-                    "three_y": float(-u.dest_z),
-                    "three_z": float(-u.dest_x),
-                }
-                pts.append(goal_three)
+        uav_keys = list(core.uavs.keys())
+        num_uavs = len(uav_keys)
+
+        for i, uid in enumerate(uav_keys):
+            pts = []
+            if core.strategic_method == "sipp":
+                plan = core.strategic_sipp.plans.get(uid)
+                if plan and plan.legs:
+                    for leg in plan.legs:
+                        pts.append({
+                            "three_x": float(leg.from_pos[1]),
+                            "three_y": float(abs(leg.from_pos[2])),
+                            "three_z": float(-leg.from_pos[0]),
+                        })
+                    pts.append({
+                        "three_x": float(plan.legs[-1].to_pos[1]),
+                        "three_y": float(abs(plan.legs[-1].to_pos[2])),
+                        "three_z": float(-plan.legs[-1].to_pos[0]),
+                    })
+            else:
+                routes = core.uav_waypoint_routes.get(uid, [])
+                if routes:
+                    angle = i * (2.0 * math.pi / max(1, num_uavs))
+                    alt_m = 90.0 if (i % 2 == 0) else 105.0
+                    sx = 260.0 * math.cos(angle)
+                    sy = 260.0 * math.sin(angle)
+                    # 1. Start Station
+                    pts.append({"three_x": float(sy), "three_y": float(alt_m), "three_z": float(-sx)})
+                    # 2. HUB_IN Gate
+                    pts.append({"three_x": float(routes[0][1]), "three_y": float(alt_m), "three_z": float(-routes[0][0])})
+                    # 3. Hub Crossing Trajectory (D4ORM / MPPI / CEM)
+                    if uid in core.uav_waypoints_4d:
+                        for w in core.uav_waypoints_4d[uid]:
+                            pts.append({
+                                "three_x": float(w[2]),
+                                "three_y": float(abs(w[3])),
+                                "three_z": float(-w[1]),
+                            })
+                    # 4. HUB_OUT Gate
+                    pts.append({"three_x": float(routes[1][1]), "three_y": float(alt_m), "three_z": float(-routes[1][0])})
+                    # 5. Destination Station
+                    pts.append({"three_x": float(routes[2][1]), "three_y": float(alt_m), "three_z": float(-routes[2][0])})
 
             trajs.append({
                 "drone_id": uid,
@@ -462,15 +549,33 @@ def get_strategic_trajectories():
                 "points": pts,
             })
 
+        min_sep = core.strategic_plan_result.min_separation_m if core.strategic_plan_result else 25.0
+        conflicts = core.strategic_plan_result.conflict_count if core.strategic_plan_result else 0
+        compute_time = core.strategic_plan_result.compute_time_s if core.strategic_plan_result else 0.01
+
         return jsonify({
             "available": True,
             "method": core.strategic_method,
             "sensor_profile": core.sensor_profile_id,
-            "min_separation": core.strategic_plan_result.min_separation_m,
-            "conflicts": core.strategic_plan_result.conflict_count,
-            "compute_time": core.strategic_plan_result.compute_time_s,
+            "min_separation": min_sep,
+            "conflicts": conflicts,
+            "compute_time": compute_time,
             "trajectories": trajs,
         })
+
+
+@app.route("/api/scenario_mode", methods=["POST"])
+def set_scenario_mode():
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode", "benchmark")
+    core.init_scenario(mode=mode)
+    return jsonify({"success": True, "mode": core.scenario_mode})
+
+
+@app.route("/api/randomize", methods=["POST"])
+def randomize_missions():
+    core.init_scenario(mode="random")
+    return jsonify({"success": True, "mode": "random"})
 
 
 @app.route("/api/params", methods=["POST"])

@@ -1466,7 +1466,9 @@
     }
 
     function resetScenario() {
-      fetch('/api/reset', { method: 'POST' });
+      fetch('/api/reset', { method: 'POST' }).then(() => {
+        fetchStrategicTrajectories();
+      });
     }
 
     let currentScenarioMode = 'benchmark';
@@ -1481,12 +1483,16 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: mode }),
+      }).then(() => {
+        fetchStrategicTrajectories();
       });
     }
 
     function randomizeDestinations() {
       setScenarioMode('random');
-      fetch('/api/randomize', { method: 'POST' });
+      fetch('/api/randomize', { method: 'POST' }).then(() => {
+        fetchStrategicTrajectories();
+      });
     }
 
     function togglePause() {
