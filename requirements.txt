@@ -32,3 +32,8 @@ wheel>=0.40.0
 #   git clone https://github.com/sybrenstuvel/Python-RVO2.git /tmp/Python-RVO2
 #   sed -i 's/VERSION 2.8/VERSION 3.5/' /tmp/Python-RVO2/CMakeLists.txt
 #   pip install --no-build-isolation /tmp/Python-RVO2
+
+# Strategic 4D Trajectory Optimization & Diffusion Denoising (D4orm, MPPI, CEM)
+jax>=0.4.26
+flax>=0.8.0
+
