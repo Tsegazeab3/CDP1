@@ -1,13 +1,17 @@
-"""Strategic 4D Multi-UAV Trajectory Deconfliction and Optimization Engine.
+"""Strategic 4D Multi-UAV Trajectory Deconfliction Engine with Heterogeneous Fleets and Sensor Profiles.
 
-Implements model-based diffusion denoising (D4orm, D4orm-D) alongside sampling
-baselines (MPPI, CEM) and uncoordinated benchmarks for pre-flight UTM deconfliction.
-Supports exporting 4D trajectories directly to BlueSky scenario (.scn) files.
+Supports:
+- Model-Based Diffusion Denoising (D4orm, D4orm-D) from arXiv:2609.35651
+- Sampling-based Trajectory Optimization (MPPI, CEM)
+- Safe Interval Path Planning (SIPP) and Uncoordinated Straight-Line Baselines
+- Sensor Profiles: UWB (High Precision, Decimeter), RTK-GPS (Centimeter), Standard GPS (Wide-Area)
+- Heterogeneous Drone Classes: Scout, Courier, Heavy-Lift
 """
 
 from __future__ import annotations
 
 import dataclasses
+import math
 import time
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -20,10 +24,104 @@ from d4orm.planners import core
 from d4orm.planners.cli import PLANNERS
 
 
+# ---------------------------------------------------------------------------
+# Drone Class & Sensor Profile Specifications
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class DroneClass:
+    """Kinodynamic specifications for a drone category."""
+    name: str
+    max_speed_ms: float
+    max_accel_ms2: float
+    physical_radius_m: float
+    color_hex: str
+    payload_capacity_kg: float
+
+
+# Heterogeneous Drone Fleet Classes
+DRONE_CLASSES: Dict[str, DroneClass] = {
+    "SCOUT": DroneClass(
+        name="SCOUT",
+        max_speed_ms=16.0,
+        max_accel_ms2=6.0,
+        physical_radius_m=0.35,
+        color_hex="#00e5ff",  # Cyan
+        payload_capacity_kg=0.5,
+    ),
+    "COURIER": DroneClass(
+        name="COURIER",
+        max_speed_ms=12.0,
+        max_accel_ms2=4.0,
+        physical_radius_m=0.60,
+        color_hex="#10b981",  # Emerald
+        payload_capacity_kg=2.5,
+    ),
+    "HEAVY_LIFT": DroneClass(
+        name="HEAVY_LIFT",
+        max_speed_ms=8.0,
+        max_accel_ms2=2.5,
+        physical_radius_m=1.10,
+        color_hex="#f97316",  # Orange
+        payload_capacity_kg=8.0,
+    ),
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class SensorProfile:
+    """Sensor navigation precision and airspace constraint specifications."""
+    id: str
+    name: str
+    description: str
+    pos_noise_sigma_m: float
+    update_rate_hz: float
+    effective_range_m: float
+    safe_separation_radius_m: float
+    corridor_pipe_radius_m: float
+    nominal_arena_scale: float
+
+
+SENSOR_PROFILES: Dict[str, SensorProfile] = {
+    "UWB": SensorProfile(
+        id="UWB",
+        name="UWB (Ultra-Wideband / Local Hub)",
+        description="High-precision decimeter positioning for GPS-denied vertiports and lab arenas.",
+        pos_noise_sigma_m=0.15,
+        update_rate_hz=40.0,
+        effective_range_m=50.0,
+        safe_separation_radius_m=2.5,
+        corridor_pipe_radius_m=3.5,
+        nominal_arena_scale=0.45,
+    ),
+    "RTK_GPS": SensorProfile(
+        id="RTK_GPS",
+        name="RTK-GPS (Centimeter Urban Airway)",
+        description="Dual-frequency carrier phase differential GNSS for structured urban corridors.",
+        pos_noise_sigma_m=0.08,
+        update_rate_hz=10.0,
+        effective_range_m=5000.0,
+        safe_separation_radius_m=6.0,
+        corridor_pipe_radius_m=8.0,
+        nominal_arena_scale=0.85,
+    ),
+    "STD_GPS": SensorProfile(
+        id="STD_GPS",
+        name="Standard GPS (Wide-Area Regional)",
+        description="Standard satellite positioning subject to atmospheric delay and urban multi-path.",
+        pos_noise_sigma_m=2.80,
+        update_rate_hz=5.0,
+        effective_range_m=50000.0,
+        safe_separation_radius_m=25.0,
+        corridor_pipe_radius_m=25.0,
+        nominal_arena_scale=1.00,
+    ),
+}
+
+
 @dataclasses.dataclass(frozen=True)
 class Waypoint4D:
     """4D space-time waypoint for a single UAV."""
-
     t: float
     x: float
     y: float
@@ -36,8 +134,8 @@ class Waypoint4D:
 @dataclasses.dataclass
 class StrategicPlanResult:
     """Standardized output from a strategic trajectory optimization run."""
-
     method: str
+    sensor_profile_id: str
     num_agents: int
     horizon_steps: int
     dt: float
@@ -49,6 +147,7 @@ class StrategicPlanResult:
     total_distance_m: float
     mean_speed_ms: float
     mean_accel_norm: float
+    agent_classes: List[str]
 
     def get_agent_waypoints(self, agent_idx: int) -> List[Waypoint4D]:
         """Returns 4D waypoints for a specific UAV."""
@@ -70,16 +169,16 @@ class StrategicPlanResult:
         return wpts
 
 
-class UAVAirspace3D(HolonomicEnvironment):
-    """Custom 3D Holonomic Environment with realistic UTM drone parameters."""
+class HeterogeneousUAVAirspace3D(HolonomicEnvironment):
+    """3D Holonomic Environment supporting heterogeneous speeds and safety envelopes."""
 
     def __init__(
         self,
         starts: jnp.ndarray,
         goals: jnp.ndarray,
-        radius: float = 25.0,
-        safe_margin: float = 5.0,
-        max_speed: float = 15.0,
+        separation_radius: float = 2.5,
+        safe_margin: float = 1.0,
+        max_speed: float = 12.0,
         max_accel: float = 4.0,
         obstacles: Optional[jnp.ndarray] = None,
     ):
@@ -87,7 +186,7 @@ class UAVAirspace3D(HolonomicEnvironment):
         self._custom_starts = starts
         self._custom_goals = goals
         super().__init__(self.num_agents, position_dim=3)
-        self.agent_radius = radius
+        self.agent_radius = separation_radius
         self.safe_margin = safe_margin
         self.max_speed = max_speed
         self.max_acceleration = max_accel
@@ -105,22 +204,18 @@ class UAVAirspace3D(HolonomicEnvironment):
 
 
 class StrategicTrajectoryOptimizer:
-    """High-level Strategic Deconfliction Planner for Multi-UAV Operations."""
+    """Unified Strategic Deconfliction Planner for Multi-UAV UTM Operations."""
 
     def __init__(
         self,
-        separation_radius_m: float = 25.0,
-        max_speed_ms: float = 15.0,
-        max_accel_ms2: float = 4.0,
+        sensor_profile_id: str = "UWB",
         dt: float = 0.2,
         horizon_steps: int = 50,
-        num_samples: int = 128,
+        num_samples: int = 64,
         num_diffuse_steps: int = 20,
         max_iterations: int = 5,
     ):
-        self.separation_radius_m = separation_radius_m
-        self.max_speed_ms = max_speed_ms
-        self.max_accel_ms2 = max_accel_ms2
+        self.sensor_profile = SENSOR_PROFILES.get(sensor_profile_id, SENSOR_PROFILES["UWB"])
         self.dt = dt
         self.horizon_steps = horizon_steps
         self.num_samples = num_samples
@@ -132,26 +227,36 @@ class StrategicTrajectoryOptimizer:
         starts: np.ndarray,
         goals: np.ndarray,
         method: Literal["d4orm", "d4orm-d", "mppi", "cem", "straight"] = "d4orm",
+        agent_classes: Optional[List[str]] = None,
         seed: int = 42,
     ) -> StrategicPlanResult:
-        """Optimizes collision-free 4D trajectories for N UAVs using the selected method."""
+        """Optimizes collision-free 4D trajectories for heterogeneous UAVs."""
         num_agents = starts.shape[0]
+        if agent_classes is None:
+            # Default heterogeneous class assignment
+            class_keys = list(DRONE_CLASSES.keys())
+            agent_classes = [class_keys[i % len(class_keys)] for i in range(num_agents)]
+
+        max_speed = max(DRONE_CLASSES[cls].max_speed_ms for cls in agent_classes)
+        max_accel = max(DRONE_CLASSES[cls].max_accel_ms2 for cls in agent_classes)
+        safe_radius = self.sensor_profile.safe_separation_radius_m
+
         t_start = time.perf_counter()
 
-        # Uncoordinated Straight-Line baseline
         if method == "straight":
-            trajectories = self._plan_straight_line(starts, goals)
+            trajectories = self._plan_straight_line(starts, goals, max_speed)
             compute_time = time.perf_counter() - t_start
         else:
             starts_jnp = jnp.array(starts, dtype=jnp.float32)
             goals_jnp = jnp.array(goals, dtype=jnp.float32)
 
-            env = UAVAirspace3D(
+            env = HeterogeneousUAVAirspace3D(
                 starts=starts_jnp,
                 goals=goals_jnp,
-                radius=self.separation_radius_m,
-                max_speed=self.max_speed_ms,
-                max_accel=self.max_accel_ms2,
+                separation_radius=safe_radius,
+                safe_margin=0.5,
+                max_speed=max_speed,
+                max_accel=max_accel,
             )
 
             planner_cfg = core.PlannerConfig(
@@ -174,15 +279,14 @@ class StrategicTrajectoryOptimizer:
             jax.block_until_ready(res.states)
             compute_time = time.perf_counter() - t_start
 
-            # Reshape JAX state from (T, N * 6) to (T, N, 6)
             raw_states = np.array(res.states)
             trajectories = raw_states.reshape(self.horizon_steps, num_agents, 6)
 
-        # Evaluate performance & safety metrics
-        metrics = self._compute_metrics(trajectories)
+        metrics = self._compute_metrics(trajectories, safe_radius)
 
         return StrategicPlanResult(
             method=method,
+            sensor_profile_id=self.sensor_profile.id,
             num_agents=num_agents,
             horizon_steps=self.horizon_steps,
             dt=self.dt,
@@ -194,10 +298,11 @@ class StrategicTrajectoryOptimizer:
             total_distance_m=metrics["total_distance_m"],
             mean_speed_ms=metrics["mean_speed_ms"],
             mean_accel_norm=metrics["mean_accel_norm"],
+            agent_classes=agent_classes,
         )
 
     def _plan_straight_line(
-        self, starts: np.ndarray, goals: np.ndarray
+        self, starts: np.ndarray, goals: np.ndarray, max_speed_ms: float
     ) -> np.ndarray:
         """Direct interpolation from start to goal at constant cruise velocity."""
         num_agents = starts.shape[0]
@@ -208,7 +313,7 @@ class StrategicTrajectoryOptimizer:
             pg = goals[i, :3]
             diff = pg - p0
             dist = np.linalg.norm(diff)
-            speed = min(self.max_speed_ms, dist / max(1.0, self.horizon_steps * self.dt))
+            speed = min(max_speed_ms, dist / max(1.0, self.horizon_steps * self.dt))
             unit_dir = diff / max(dist, 1e-6)
             vel = unit_dir * speed
 
@@ -220,13 +325,14 @@ class StrategicTrajectoryOptimizer:
 
         return trajectories
 
-    def _compute_metrics(self, trajectories: np.ndarray) -> Dict[str, float]:
+    def _compute_metrics(
+        self, trajectories: np.ndarray, safe_radius_m: float
+    ) -> Dict[str, float]:
         """Calculates safety, separation distance, and kinetic metrics."""
         T, N, _ = trajectories.shape
         min_sep = float("inf")
         conflicts = 0
 
-        # Pairwise minimum distance
         for t in range(T):
             for i in range(N):
                 for j in range(i + 1, N):
@@ -235,10 +341,9 @@ class StrategicTrajectoryOptimizer:
                     dist = float(np.linalg.norm(p_i - p_j))
                     if dist < min_sep:
                         min_sep = dist
-                    if dist < self.separation_radius_m:
+                    if dist < safe_radius_m:
                         conflicts += 1
 
-        # Distance, speeds, accelerations
         tot_dist = 0.0
         speeds = []
         accels = []
@@ -276,32 +381,29 @@ class StrategicTrajectoryOptimizer:
         lines = [
             f"# BlueSky Strategic 4D Trajectory Scenario",
             f"# Generated by StrategicTrajectoryOptimizer (Method: {result.method})",
-            f"# Total Agents: {result.num_agents} | Horizon: {result.total_time_s:.1f}s",
+            f"# Sensor Profile: {result.sensor_profile_id} | Agents: {result.num_agents}",
             "00:00:00.00>HOLD",
-            "00:00:00.00>PAN 25.2048 55.2708",
+            f"00:00:00.00>PAN {origin_lat:.4f} {origin_lon:.4f}",
             "00:00:00.00>ZOOM 1.0",
         ]
 
-        # Sample key waypoints (e.g. every 5 timesteps)
         step_interval = max(1, result.horizon_steps // 10)
 
         for i in range(result.num_agents):
             callsign = f"{callsign_prefix}{i+1:02d}"
             p0 = result.trajectories[0, i, :3]
             lon0, lat0 = proj(float(p0[0]), float(p0[1]), inverse=True)
-            alt0_ft = max(100.0, float(p0[2]) * 3.28084)
-            speed_kts = max(10.0, float(np.linalg.norm(result.trajectories[0, i, 3:])) * 1.94384)
+            alt0_ft = max(50.0, float(p0[2]) * 3.28084)
+            speed_kts = max(6.0, float(np.linalg.norm(result.trajectories[0, i, 3:])) * 1.94384)
 
-            # Create aircraft in BlueSky
             lines.append(
                 f"00:00:00.00>CRE {callsign} MAVIC {lat0:.6f} {lon0:.6f} 0 {alt0_ft:.1f} {speed_kts:.1f}"
             )
 
-            # Add subsequent 4D waypoints along the deconflicted trajectory
             for step in range(step_interval, result.horizon_steps, step_interval):
                 pos = result.trajectories[step, i, :3]
                 lon_k, lat_k = proj(float(pos[0]), float(pos[1]), inverse=True)
-                alt_k_ft = max(100.0, float(pos[2]) * 3.28084)
+                alt_k_ft = max(50.0, float(pos[2]) * 3.28084)
                 lines.append(
                     f"00:00:00.00>ADDWPT {callsign} {lat_k:.6f} {lon_k:.6f} {alt_k_ft:.1f}"
                 )

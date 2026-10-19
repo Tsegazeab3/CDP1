@@ -338,6 +338,22 @@
       <input type="checkbox" id="layer-ribbons" checked onchange="toggleLayers()">
     </div>
 
+    <div class="panel-section-title" style="margin-top: 14px;">Strategic Deconfliction Algorithm</div>
+    <select id="select-strategic-algo" class="hud-select" onchange="changeStrategicAlgorithm(this.value)" style="width: 100%; background: #0f172a; color: #38bdf8; border: 1px solid #38bdf8; padding: 6px 8px; border-radius: 4px; font-family: monospace; font-size: 11px; margin-bottom: 6px;">
+      <option value="d4orm" selected>D4orm (Diffusion Denoising) [T-RO '26]</option>
+      <option value="sipp">SIPP (Corridor Network)</option>
+      <option value="mppi">MPPI (Path Integral Sampling)</option>
+      <option value="cem">CEM (Cross-Entropy Method)</option>
+      <option value="straight">Straight-Line (Uncoordinated Baseline)</option>
+    </select>
+
+    <div class="panel-section-title" style="margin-top: 10px;">Sensor & Airspace Profile</div>
+    <select id="select-sensor-profile" class="hud-select" onchange="changeSensorProfile(this.value)" style="width: 100%; background: #0f172a; color: #10b981; border: 1px solid #10b981; padding: 6px 8px; border-radius: 4px; font-family: monospace; font-size: 11px; margin-bottom: 6px;">
+      <option value="UWB" selected>UWB (Decimeter / Local Vertiport - 2.5m)</option>
+      <option value="RTK_GPS">RTK-GPS (Centimeter / Urban Corridor - 6.0m)</option>
+      <option value="STD_GPS">Standard GPS (Wide-Area Regional - 25.0m)</option>
+    </select>
+
     <div class="panel-section-title" style="margin-top: 14px;">Scenario Routing Mode</div>
     <div class="btn-group" id="scenario-mode-buttons" style="margin-bottom: 8px;">
       <button class="hud-btn active" id="btn-mode-benchmark" onclick="setScenarioMode('benchmark')">Fixed Loop</button>
@@ -1013,12 +1029,13 @@
 
         if (!corridorEdgeMeshes[edge.id]) {
           // Create tube along edge
+          const pipeRadius = data.pipe_radius || 3.5;
           const mid = new THREE.Vector3().addVectors(from, to).multiplyScalar(0.5);
-          const geo = new THREE.CylinderGeometry(3.5, 3.5, length, 8, 1, false);
+          const geo = new THREE.CylinderGeometry(pipeRadius, pipeRadius, length, 12, 1, false);
           const mat = new THREE.MeshBasicMaterial({
             color: color,
             transparent: true,
-            opacity: 0.18,
+            opacity: 0.22,
             side: THREE.DoubleSide,
           });
           const tube = new THREE.Mesh(geo, mat);
@@ -1235,13 +1252,19 @@
           r.rotation.y = (idx % 2 === 0 ? phase : -phase);
         });
 
-        // Protective Bubble Separation Status
+        // Protective Bubble Separation Status (Dynamically scaled by sensor profile)
+        const profile = item.sensor_profile || currentSensorProfile;
+        const currentBubbleRadius = (profile === 'UWB' ? 2.5 : (profile === 'RTK_GPS' ? 6.0 : 25.0));
+        const bubbleScale = currentBubbleRadius / 25.0;
+        u.bubble.scale.setScalar(bubbleScale);
+        u.ring.scale.setScalar(bubbleScale);
+
         const inConflict = item.in_conflict || false;
         if (inConflict) anyConflictGlobal = true;
-        const bubbleColor = inConflict ? 0xef4444 : (item.min_dist < 50.0 ? 0xf59e0b : 0x10b981);
+        const bubbleColor = inConflict ? 0xef4444 : (item.min_dist < (currentBubbleRadius * 2.0) ? 0xf59e0b : 0x10b981);
         u.bubble.material.color.setHex(bubbleColor);
         u.ring.material.color.setHex(bubbleColor);
-        u.bubble.material.opacity = inConflict ? 0.35 : 0.12;
+        u.bubble.material.opacity = inConflict ? 0.35 : 0.14;
 
         // Altitude Drop Line
         const dropPoints = [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, -py, 0)];
@@ -1359,12 +1382,18 @@
         const dest = u.destination || plan.destination || '';
         const missionRoute = (origin && dest && origin !== dest) ? `${origin} &rarr; ${dest}` : `${sippEdge} (${sippLeg})`;
 
+        const droneClass = u.drone_class || 'COURIER';
+        const stratMethod = (u.strategic_method || 'd4orm').toUpperCase();
+        const classColor = droneClass === 'SCOUT' ? '#00e5ff' : (droneClass === 'HEAVY_LIFT' ? '#f97316' : '#10b981');
+
         card.innerHTML = `
           <div class="uav-card-header">
-            <span class="uav-id">${u.id === 'Ego' ? 'EGO (PX4 SITL)' : u.id} ${layerBadgeHtml} <span style="font-size: 10px; color: #a855f7;">[${missionType}]</span></span>
+            <span class="uav-id">${u.id === 'Ego' ? 'EGO (PX4 SITL)' : u.id} <span style="font-size: 10px; font-weight: 700; padding: 2px 5px; border-radius: 3px; background: rgba(56, 189, 248, 0.2); color: ${classColor}; border: 1px solid ${classColor}; margin-left: 4px;">${droneClass}</span> ${layerBadgeHtml}</span>
             <span class="uav-mode">${u.in_conflict ? 'CONFLICT' : 'CLEAR'}</span>
           </div>
           <div class="telemetry-grid">
+            <div class="tel-item"><span>Strategy:</span><span class="tel-val" style="color: #38bdf8;">${stratMethod}</span></div>
+            <div class="tel-item"><span>Sensor:</span><span class="tel-val" style="color: #10b981;">${u.sensor_profile || 'UWB'}</span></div>
             <div class="tel-item"><span>Corridor:</span><span class="tel-val" style="color: #00e5ff;">${sippEdge} (${sippLeg})</span></div>
             <div class="tel-item"><span>Mission:</span><span class="tel-val" style="color: #ffd700; font-size: 10px;">${missionRoute}</span></div>
             <div class="tel-item"><span>Alt (Z):</span><span class="tel-val">${alt} m</span></div>
@@ -1467,6 +1496,73 @@
       });
     }
 
+    let currentStrategicMethod = 'd4orm';
+    let currentSensorProfile = 'UWB';
+    const strategicPathMeshes = {}; // drone_id -> THREE.Line
+
+    function changeStrategicAlgorithm(method) {
+      currentStrategicMethod = method;
+      fetch('/api/set_strategic_method', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method: method }),
+      }).then(() => {
+        fetchStrategicTrajectories();
+      });
+    }
+
+    function changeSensorProfile(profile) {
+      currentSensorProfile = profile;
+      fetch('/api/set_sensor_profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile: profile }),
+      }).then(() => {
+        fetch('/api/corridor_graph')
+          .then(res => res.json())
+          .then(data => handleCorridorTelemetry(data));
+        fetchStrategicTrajectories();
+      });
+    }
+
+    function fetchStrategicTrajectories() {
+      fetch('/api/strategic_trajectories')
+        .then(res => res.json())
+        .then(data => {
+          if (!data || !data.available) {
+            Object.values(strategicPathMeshes).forEach(line => scene.remove(line));
+            return;
+          }
+
+          data.trajectories.forEach(t => {
+            const pts = t.points.map(p => nedToThree(p.x, p.y, p.z));
+            const curve = new THREE.CatmullRomCurve3(pts);
+            const smoothPts = curve.getPoints(60);
+            const geo = new THREE.BufferGeometry().setFromPoints(smoothPts);
+
+            if (!strategicPathMeshes[t.drone_id]) {
+              const mat = new THREE.LineDashedMaterial({
+                color: uavColorPalette[t.drone_id] || 0x38bdf8,
+                dashSize: 4,
+                gapSize: 2,
+                linewidth: 2,
+                transparent: true,
+                opacity: 0.85,
+              });
+              const line = new THREE.Line(geo, mat);
+              line.computeLineDistances();
+              scene.add(line);
+              strategicPathMeshes[t.drone_id] = line;
+            } else {
+              strategicPathMeshes[t.drone_id].geometry.dispose();
+              strategicPathMeshes[t.drone_id].geometry = geo;
+              strategicPathMeshes[t.drone_id].computeLineDistances();
+            }
+          });
+        })
+        .catch(err => console.warn('Strategic trajectories fetch error:', err));
+    }
+
     // --- Render Loop ---
     function animate() {
       requestAnimationFrame(animate);
@@ -1488,6 +1584,7 @@
       .catch(err => console.warn('[3D Visualizer] Initial corridor fetch error:', err));
 
     connectTelemetryStream();
+    fetchStrategicTrajectories();
     animate();
   </script>
 </body>
