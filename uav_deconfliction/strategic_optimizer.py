@@ -180,6 +180,7 @@ class HeterogeneousUAVAirspace3D(HolonomicEnvironment):
         safe_margin: float = 1.0,
         max_speed: float = 12.0,
         max_accel: float = 4.0,
+        stop_distance: Optional[float] = None,
         obstacles: Optional[jnp.ndarray] = None,
     ):
         self.num_agents = starts.shape[0]
@@ -190,6 +191,8 @@ class HeterogeneousUAVAirspace3D(HolonomicEnvironment):
         self.safe_margin = safe_margin
         self.max_speed = max_speed
         self.max_acceleration = max_accel
+        self.stop_distance = stop_distance if stop_distance is not None else max(5.0, separation_radius * 1.5)
+        self.stop_velocity = float("inf")
         self.x0 = self._custom_starts.flatten()
         self.xg = self._custom_goals.flatten()
         if obstacles is not None and len(obstacles) > 0:
@@ -209,18 +212,30 @@ class StrategicTrajectoryOptimizer:
     def __init__(
         self,
         sensor_profile_id: str = "UWB",
-        dt: float = 0.2,
-        horizon_steps: int = 50,
+        dt: float = 0.25,
+        horizon_steps: int = 60,
         num_samples: int = 64,
         num_diffuse_steps: int = 20,
         max_iterations: int = 5,
+        separation_radius_m: Optional[float] = None,
+        max_speed_ms: Optional[float] = None,
+        max_accel_ms2: Optional[float] = None,
     ):
-        self.sensor_profile = SENSOR_PROFILES.get(sensor_profile_id, SENSOR_PROFILES["UWB"])
+        base_profile = SENSOR_PROFILES.get(sensor_profile_id, SENSOR_PROFILES["UWB"])
+        if separation_radius_m is not None:
+            self.sensor_profile = dataclasses.replace(
+                base_profile, safe_separation_radius_m=separation_radius_m
+            )
+        else:
+            self.sensor_profile = base_profile
+
         self.dt = dt
         self.horizon_steps = horizon_steps
         self.num_samples = num_samples
         self.num_diffuse_steps = num_diffuse_steps
         self.max_iterations = max_iterations
+        self.custom_max_speed = max_speed_ms
+        self.custom_max_accel = max_accel_ms2
 
     def plan(
         self,
@@ -237,8 +252,16 @@ class StrategicTrajectoryOptimizer:
             class_keys = list(DRONE_CLASSES.keys())
             agent_classes = [class_keys[i % len(class_keys)] for i in range(num_agents)]
 
-        max_speed = max(DRONE_CLASSES[cls].max_speed_ms for cls in agent_classes)
-        max_accel = max(DRONE_CLASSES[cls].max_accel_ms2 for cls in agent_classes)
+        if self.custom_max_speed is not None:
+            max_speed = self.custom_max_speed
+        else:
+            max_speed = max(DRONE_CLASSES[cls].max_speed_ms for cls in agent_classes)
+
+        if self.custom_max_accel is not None:
+            max_accel = self.custom_max_accel
+        else:
+            max_accel = max(DRONE_CLASSES[cls].max_accel_ms2 for cls in agent_classes)
+
         safe_radius = self.sensor_profile.safe_separation_radius_m
 
         t_start = time.perf_counter()
@@ -257,6 +280,7 @@ class StrategicTrajectoryOptimizer:
                 safe_margin=0.5,
                 max_speed=max_speed,
                 max_accel=max_accel,
+                stop_distance=max(5.0, safe_radius * 1.5),
             )
 
             planner_cfg = core.PlannerConfig(

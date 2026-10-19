@@ -67,6 +67,11 @@ class DynamicUAVState:
     target_z: float = -100.0
     wp_index: int = 0
 
+    # Final Mission Destination (for stationary 3D goal beacon ring)
+    dest_x: float = 0.0
+    dest_y: float = 0.0
+    dest_z: float = -100.0
+
 
 class QuadcopterPhysicsSimulator:
     """

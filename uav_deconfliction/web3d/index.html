@@ -301,7 +301,7 @@
     </div>
     <div class="control-row">
       <label>Altitude Layer Planes & Rings</label>
-      <input type="checkbox" id="layer-planes" checked onchange="toggleAltitudeFeatures()">
+      <input type="checkbox" id="layer-planes" onchange="toggleAltitudeFeatures()">
     </div>
     <div class="control-row">
       <label>Vertical Altitude Scale / Mast</label>
@@ -309,7 +309,7 @@
     </div>
     <div class="control-row">
       <label>Vertical Tolerance Bands (&plusmn;8m)</label>
-      <input type="checkbox" id="layer-bands" checked onchange="toggleAltitudeFeatures()">
+      <input type="checkbox" id="layer-bands" onchange="toggleAltitudeFeatures()">
     </div>
     <div class="control-row">
       <label>Corridor Tubes (Cylinders)</label>
@@ -1306,11 +1306,14 @@
           }
         }
 
-        // 3D Waypoint Beacon & Guidance Line
-        if (item.target_x !== undefined && u.wpGroup) {
-          const wpx = item.target_y;
-          const wpy = -item.target_z;
-          const wpz = -item.target_x;
+        // 3D Destination Beacon & Strategic Guidance Line
+        const goalX = (item.dest_x !== undefined) ? item.dest_x : item.target_x;
+        const goalY = (item.dest_y !== undefined) ? item.dest_y : item.target_y;
+        const goalZ = (item.dest_z !== undefined) ? item.dest_z : item.target_z;
+        if (goalX !== undefined && u.wpGroup) {
+          const wpx = goalY;
+          const wpy = -goalZ;
+          const wpz = -goalX;
           u.wpGroup.position.set(wpx, 0, wpz);
           u.wpRing.position.y = wpy;
           u.wpRing.rotation.z += 0.03;
@@ -1535,9 +1538,24 @@
           }
 
           data.trajectories.forEach(t => {
-            const pts = t.points.map(p => nedToThree(p.x, p.y, p.z));
-            const curve = new THREE.CatmullRomCurve3(pts);
-            const smoothPts = curve.getPoints(60);
+            if (!t.points || t.points.length === 0) return;
+
+            // Filter redundant near-duplicate points to ensure clean Catmull-Rom curve
+            const rawVectors = t.points.map(p => new THREE.Vector3(p.three_x, p.three_y, p.three_z));
+            const filteredPts = [rawVectors[0]];
+            for (let i = 1; i < rawVectors.length; i++) {
+              const last = filteredPts[filteredPts.length - 1];
+              if (rawVectors[i].distanceTo(last) > 0.4 || i === rawVectors.length - 1) {
+                filteredPts.push(rawVectors[i]);
+              }
+            }
+
+            if (filteredPts.length < 2) return;
+
+            const curve = new THREE.CatmullRomCurve3(filteredPts);
+            const numSamples = Math.max(40, filteredPts.length * 2);
+            const smoothPts = curve.getPoints(numSamples);
+            smoothPts[smoothPts.length - 1] = filteredPts[filteredPts.length - 1];
             const geo = new THREE.BufferGeometry().setFromPoints(smoothPts);
 
             if (!strategicPathMeshes[t.drone_id]) {
@@ -1578,6 +1596,7 @@
 
     // Start
     initAltitudeLayers();
+    applyAltitudeFilter();
     fetch('/api/corridor_graph')
       .then(res => res.json())
       .then(data => handleCorridorTelemetry(data))

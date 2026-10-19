@@ -96,8 +96,8 @@ class Simulation3DCore:
         self.strategic_sipp = StrategicController(num_drones=10, wind_vector=self.physics.steady_wind)
         self.strategic_optimizer = StrategicTrajectoryOptimizer(
             sensor_profile_id=self.sensor_profile_id,
-            dt=0.2,
-            horizon_steps=60,
+            dt=0.35,
+            horizon_steps=70,
             num_samples=64,
             num_diffuse_steps=20,
             max_iterations=5,
@@ -128,8 +128,8 @@ class Simulation3DCore:
             self.deconflict_engine.radius = self.current_sensor_profile.safe_separation_radius_m
             self.strategic_optimizer = StrategicTrajectoryOptimizer(
                 sensor_profile_id=self.sensor_profile_id,
-                dt=0.2,
-                horizon_steps=60,
+                dt=0.35,
+                horizon_steps=70,
                 num_samples=64,
                 num_diffuse_steps=20,
                 max_iterations=5,
@@ -192,7 +192,7 @@ class Simulation3DCore:
             self.strategic_sipp.initialize_scenario(drone_ids, sim_time=0.0)
             self.strategic_plan_result = None
         else:
-            opt_method = "d4orm" if self.strategic_method not in ["mppi", "cem", "straight"] else self.strategic_method
+            opt_method = self.strategic_method if self.strategic_method in ["d4orm", "d4orm-d", "mppi", "cem", "straight"] else "d4orm"
             agent_classes = [self.uav_classes[uid] for uid in drone_ids]
             self.strategic_plan_result = self.strategic_optimizer.plan(
                 starts=starts_arr,
@@ -221,12 +221,14 @@ class Simulation3DCore:
                 else:
                     tx, ty, tz = goals_arr[i, 0], goals_arr[i, 1], -goals_arr[i, 2]
 
+                gx, gy, gz = goals_arr[i, 0], goals_arr[i, 1], -goals_arr[i, 2]
                 self.uavs[uid] = DynamicUAVState(
                     id=uid,
                     x=sx, y=sy, z=altitude,
                     vx=0.0, vy=0.0, vz=0.0,
                     color=d_class.color_hex,
                     target_x=tx, target_y=ty, target_z=tz,
+                    dest_x=gx, dest_y=gy, dest_z=gz,
                     wp_index=0,
                 )
 
@@ -435,11 +437,29 @@ def get_strategic_trajectories():
 
         trajs = []
         for i in range(core.strategic_plan_result.num_agents):
+            uid = f"UAV-{i+1:02d}"
             wpts = core.strategic_plan_result.get_agent_waypoints(i)
+            pts = [
+                {
+                    "three_x": float(w.y),
+                    "three_y": float(abs(w.z)),
+                    "three_z": float(-w.x)
+                }
+                for w in wpts
+            ]
+            u = core.uavs.get(uid)
+            if u is not None and u.dest_x is not None:
+                goal_three = {
+                    "three_x": float(u.dest_y),
+                    "three_y": float(-u.dest_z),
+                    "three_z": float(-u.dest_x),
+                }
+                pts.append(goal_three)
+
             trajs.append({
-                "drone_id": f"UAV-{i+1:02d}",
-                "class": core.uav_classes.get(f"UAV-{i+1:02d}", "COURIER"),
-                "points": [{"x": float(w.x), "y": float(w.y), "z": float(w.z)} for w in wpts]
+                "drone_id": uid,
+                "class": core.uav_classes.get(uid, "COURIER"),
+                "points": pts,
             })
 
         return jsonify({
