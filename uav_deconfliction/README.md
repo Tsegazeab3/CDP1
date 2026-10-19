@@ -88,3 +88,16 @@ Offboard setpoints are dispatched to PX4 SITL using `SET_POSITION_TARGET_LOCAL_N
 - **Type Mask:** `0x0DC7` (Ignoring $X, Y, Z, A_X, A_Y, A_Z, \text{Yaw}, \dot{\text{Yaw}}$)
 - **Velocity Payload:** $v_x = v_{x,\text{cmd}}$, $v_y = v_{y,\text{cmd}}$, $v_z = 0.0$
 - **Companion Heartbeat:** Dispatched at $1\text{ Hz}$ (`MAV_TYPE_ONBOARD_CONTROLLER`)
+
+---
+
+## 4. Contributors / Team Members
+
+| Name | Student ID | Email |
+| :--- | :--- | :--- |
+| **Tsegazeab Kebede** | H00540222 | H00540222@hct.ac.ae |
+| **Firaol Birhanu** | H00540197 | H00540197@hct.ac.ae |
+| **Firew Borsamo** | H00540207 | H00540207@hct.ac.ae |
+| **Elias Endashaw** | H00540220 | H00540220@hct.ac.ae |
+| **Ferhan Ibrahim** | H00540217 | H00540217@hct.ac.ae |
+
